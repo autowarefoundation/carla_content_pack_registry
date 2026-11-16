@@ -137,6 +137,22 @@ pytest                     # Python: CARLA 側（mount / unmount の順序）と
 maturin build --release    # wheel（abi3: Python 3.10 以上で共通）
 ```
 
+## リリース
+
+`v<バージョン>` のタグを push すると [release workflow](.github/workflows/release.yml) が自動で動きます。
+
+```bash
+# Cargo.toml の version を上げて Cargo.lock も更新し、main にマージしてから
+cargo update -p carla-pack
+git tag v0.3.0 && git push origin v0.3.0
+```
+
+1. タグと `Cargo.toml` / `Cargo.lock` のバージョンが一致するか確認（不一致なら失敗）
+2. `cargo test` と、Linux / macOS / Windows の wheel と sdist のビルド（[wheels.yml](.github/workflows/wheels.yml)）
+3. GitHub Release を作成し、wheel・sdist・`SHA256SUMS` を添付（リリースノートは自動生成）。`v0.3.0-rc.1` のように `-` を含むバージョンは pre-release
+4. PyPI への公開（任意）: PyPI で Trusted Publisher（workflow `release.yml`、environment `pypi`）を登録し、
+   リポジトリ変数 `PUBLISH_PYPI` を `true` にすると有効になります。API トークンは不要です。
+
 ## ドキュメント
 
 | ドキュメント | 内容 |

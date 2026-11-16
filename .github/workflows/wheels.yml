@@ -1,9 +1,10 @@
 # Builds carla-pack wheels (abi3, Python >= 3.10) for Linux/macOS/Windows and an sdist.
-# Artifacts only: publishing to PyPI needs a trusted-publisher setup and an explicit decision.
+# Run by hand for artifacts only, or called by release.yml, which publishes them.
 name: carla-pack wheels
 
 on:
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
