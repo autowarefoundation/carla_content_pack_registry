@@ -41,10 +41,13 @@ on:
 permissions:
   contents: read
 
-# Two release merges in quick succession must not bump from the same base version.
+# Only pull-request dry runs are grouped (a newer push supersedes an older one). Pushes to
+# main are not: GitHub keeps one pending run per group and cancels the rest, so a group
+# would silently drop a labelled merge that queued behind another. Two releases racing
+# are handled where it matters instead, in `commit, tag and push`.
 concurrency:
-  group: release-${{ github.event_name == 'pull_request' && github.ref || 'main' }}
-  cancel-in-progress: false
+  group: release-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   # Reads the release label off the merged PR and, if there is one, bumps, tags and
@@ -94,34 +97,41 @@ jobs:
           ref: main
           fetch-depth: 0
 
-      - name: bump Cargo.toml and Cargo.lock together
+      # Bumps from the tip of main, not from the merged commit, and retries when another
+      # release (or any push) lands first: the rejected commit is dropped, main is fetched
+      # again and the bump recomputed, so two merges never claim the same version.
+      - name: bump, commit, tag and push
         if: steps.pr.outputs.bump != 'none'
         id: bump
-        run: |
-          set -euo pipefail
-          next=$(python3 scripts/bump-cli-version.py "${{ steps.pr.outputs.bump }}")
-          echo "tag=v${next}" >> "$GITHUB_OUTPUT"
-          echo "Bumped to ${next} (${{ steps.pr.outputs.bump }})"
-
-      - name: fail if the tag already exists
-        if: steps.pr.outputs.bump != 'none'
-        run: |
-          if git rev-parse "refs/tags/${{ steps.bump.outputs.tag }}" >/dev/null 2>&1; then
-            echo "Tag ${{ steps.bump.outputs.tag }} already exists" >&2
-            exit 1
-          fi
-
-      - name: commit, tag and push
-        if: steps.pr.outputs.bump != 'none'
+        env:
+          BUMP: ${{ steps.pr.outputs.bump }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Cargo.toml Cargo.lock
-          git commit -m "chore(release): ${{ steps.bump.outputs.tag }}"
-          git tag -a "${{ steps.bump.outputs.tag }}" -m "Release ${{ steps.bump.outputs.tag }}"
-          git push origin "HEAD:main"
-          git push origin "${{ steps.bump.outputs.tag }}"
+          for attempt in 1 2 3 4 5; do
+            git fetch --quiet --tags origin main
+            git reset --quiet --hard FETCH_HEAD
+            next=$(python3 scripts/bump-cli-version.py "$BUMP")
+            tag="v${next}"
+            if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+              echo "::error::Tag ${tag} already exists"
+              exit 1
+            fi
+            git add Cargo.toml Cargo.lock
+            git commit --quiet -m "chore(release): ${tag}"
+            if git push origin HEAD:main; then
+              git tag -a "${tag}" -m "Release ${tag}"
+              git push origin "${tag}"
+              echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+              echo "Released ${tag} (${BUMP})"
+              exit 0
+            fi
+            echo "main moved while releasing (attempt ${attempt}); bumping again from the new tip"
+            sleep $((attempt * 5))
+          done
+          echo "::error::Could not push the release commit to main"
+          exit 1
 
       - name: GitHub release with generated notes
         if: steps.pr.outputs.bump != 'none'
