@@ -1,94 +1,94 @@
 # carla-pack
 
-CARLA 用 Content Pack を **GitHub のリポジトリ権限で配布する** ためのクライアントです。サーバはありません。
+A client for **distributing CARLA content packs through GitHub repository permissions**. There is no server.
 
 ```
-carla-pack ──(1) GitHub API: carla-packs.toml を読む ───────────► GitHub（Private リポジトリ）
-           ──(2) GitHub API: 読み取り専用の S3 鍵を読む ─────────►   └ Release "carla-pack-credentials"
-           ──(3) SigV4 で直接ダウンロード ───────────────────────► S3 互換ストレージ（R2 / S3 / MinIO …）
-           ──(4) SHA-256 と carla-pack.json で検証 → 配置 → mount ─► CARLA サーバ
+carla-pack ──(1) GitHub API: read carla-packs.toml ──────────────► GitHub (private repository)
+           ──(2) GitHub API: read the read-only S3 key ───────────►   └ Release "carla-pack-credentials"
+           ──(3) download directly with SigV4 ────────────────────► S3-compatible storage (R2 / S3 / MinIO …)
+           ──(4) verify with SHA-256 and carla-pack.json → install → mount ─► CARLA server
 ```
 
-- **アクセス権の確認は GitHub が行います。** Pack リポジトリ（Private）を読めるユーザーだけが、
-  マニフェスト `carla-packs.toml` と、Release に置かれた読み取り専用のストレージ鍵を取得できます。読めない人には GitHub が 404 を返すだけです。
-  誰に配るかは、そのリポジトリの Read 権限（ユーザー / Team / Organization）でそのまま決まります。
-- **ファイルは S3 互換ストレージから直接** ダウンロードします（Cloudflare R2、AWS S3、MinIO、SeaweedFS など）。
-  誰に配ってもよい Pack は **Hugging Face Hub の公開リポジトリ** にも置けます（鍵不要、匿名で取得）。
-- 鍵は Pack リポジトリの GitHub Actions が **6 時間ごとに作り直す有効期限 12 時間の一時鍵** で、バケットの Pack 用プレフィックスを読むことしかできません。
-  R2 は一時認証情報 API、AWS は GitHub OIDC で発行するので、長期の鍵はどこにも保存しません。
-- ダウンロードしたファイルはマニフェストの **SHA-256 とサイズ**、さらに Pack 自身の `carla-pack.json` の全ファイルのハッシュで検証してから配置します。
-- コア（GitHub API、SigV4、ダウンロード、検証、展開）は Rust、CLI と CARLA へのマウントは Python です（PyO3 / maturin、abi3 wheel）。
+- **GitHub checks access.** Only users who can read the (private) pack repository can fetch
+  the manifest `carla-packs.toml` and the read-only storage key stored in a Release. Anyone else just gets a 404 from GitHub.
+  Who receives the packs is decided directly by Read permission on that repository (users / teams / organizations).
+- **Files are downloaded directly from S3-compatible storage** (Cloudflare R2, AWS S3, MinIO, SeaweedFS, etc.).
+  Packs that anyone may have can also live in a **public Hugging Face Hub repository** (no key, anonymous download).
+- The key is a **temporary key valid for 12 hours, recreated every 6 hours** by the pack repository's GitHub Actions. It can only read the pack prefix of the bucket.
+  R2 issues it through its temporary credentials API and AWS through GitHub OIDC, so no long-lived key is stored anywhere.
+- Downloaded files are verified against the manifest's **SHA-256 and size**, and then against the hashes of every file in the pack's own `carla-pack.json`, before they are installed.
+- The core (GitHub API, SigV4, download, verification, extraction) is Rust; the CLI and mounting into CARLA are Python (PyO3 / maturin, abi3 wheel).
 
-旧版（Cloudflare Workers / AWS Lambda の Registry サーバ）は廃止しました。その設計との違いは [docs/architecture.md](docs/architecture.md) にあります。
+The previous version (a Registry server on Cloudflare Workers / AWS Lambda) has been retired. How this design differs from it is described in [docs/architecture.md](docs/architecture.md).
 
-## 使う（Pack をダウンロードする側）
+## Using packs (downloading)
 
 ```bash
-pip install carla-pack-registry   # 開発中は「開発」を参照
+pip install carla-pack-registry   # during development, see "Development"
 
-gh auth login                     # GitHub CLI のトークンをそのまま使います（GH_TOKEN / GITHUB_TOKEN / carla-pack login でも可）
+gh auth login                     # the GitHub CLI's token is used as is (GH_TOKEN / GITHUB_TOKEN / carla-pack login also work)
 carla-pack whoami
-carla-pack repo add tier4/carla-packs     # マップ名で探すときの検索対象（CARLA_PACK_REPOS でも指定可）
+carla-pack repo add tier4/carla-packs     # repositories searched by map name (CARLA_PACK_REPOS also works)
 
-carla-pack ls                             # 読めるリポジトリの Pack 一覧
-carla-pack find NishishinjukuMap          # そのマップを含む Pack
+carla-pack ls                             # packs in the repositories you can read
+carla-pack find NishishinjukuMap          # packs containing that map
 carla-pack install NishishinjukuMap --map \
   --packs-dir /opt/carla/Linux/CarlaUnreal/Packs --mount localhost:2000
-carla-pack install tier4/carla-packs/NishishinjukuPack@1.2.0 --packs-dir ./Packs   # 参照で指定
-carla-pack pull tier4/carla-packs/NishishinjukuPack -o ./downloads               # tarball だけ取得
+carla-pack install tier4/carla-packs/NishishinjukuPack@1.2.0 --packs-dir ./Packs   # by reference
+carla-pack pull tier4/carla-packs/NishishinjukuPack -o ./downloads               # only fetch the tarball
 ```
 
-PyPI の配布名は `carla-pack-registry`、Python のモジュール名は `carla_pack_registry`、コマンド名は `carla-pack` です
-（CARLA 本体の `Util/ContentPacks/carla_pack.py` と同じ環境に入れても衝突しません）。
+The PyPI distribution is `carla-pack-registry`, the Python module is `carla_pack_registry` and the command is `carla-pack`
+(it does not clash with CARLA's own `Util/ContentPacks/carla_pack.py` in the same environment).
 
-Pack の指定は `OWNER/REPO/PACK[@VERSION]` です。バージョンを省略すると最新（`--base-release` / `--platform` で絞り込み）、
-`--sha256` を付けるとその成果物に固定します（lock ファイル用）。
+A pack is referred to as `OWNER/REPO/PACK[@VERSION]`. Without a version the latest is used (narrowed with `--base-release` / `--platform`);
+`--sha256` pins it to that artifact (for lock files).
 
-### Python から（シナリオライブラリへの組み込み）
+### From Python (in a scenario library)
 
 ```python
-import typesafe_carla.carla as carla   # 公式の carla モジュールでも可
+import typesafe_carla.carla as carla   # the official carla module also works
 from carla_pack_registry import Client, deploy_pack, ensure_map
 
 client = carla.Client("localhost", 2000)
 
-# サーバに無いマップだけ、読めるリポジトリから探して取得・検証・配置・mount する。あれば何もしない（None）。
+# Only when the server lacks the map: find it in the readable repositories, fetch, verify, install and mount it. Otherwise do nothing (None).
 pack = ensure_map(client, "NishishinjukuMap", "/opt/carla/Linux/CarlaUnreal/Packs",
                   repos=["tier4/carla-packs"])
 client.load_world("NishishinjukuMap")
 
-# lock ファイルの内容（参照 + SHA-256）で再現性のある取得
+# Reproducible fetch from a lock file's contents (reference + SHA-256)
 deploy_pack("tier4/carla-packs/NishishinjukuPack", packs_dir, carla_client=client,
             sha256=pack["sha256"])
 
-# 低レベル API
-c = Client()                                     # トークン・検索対象は環境 / 保存済み設定から
+# Low-level API
+c = Client()                                     # token and searched repositories come from the environment / saved settings
 release = c.find_map("NishishinjukuMap")         # {"ref", "repo", "name", "version", "sha256", "maps", ...}
-path = c.fetch(release)                          # キャッシュ（SHA-256 名）に取得して検証、パスを返す
-c.install(release, packs_dir)                    # 検証して <packs_dir>/<name> に配置（同一なら何もしない）
+path = c.fetch(release)                          # fetch into the cache (named by SHA-256), verify, return the path
+c.install(release, packs_dir)                    # verify and install into <packs_dir>/<name> (no-op if identical)
 ```
 
-- `packs_dir` は CARLA サーバから同じパスで読める場所にしてください（パッケージの `Linux/CarlaUnreal/Packs`、`-carla-packs=<dir>`、または mount するなら任意のフォルダ）。
-- 同じ Pack（名前・バージョン・base release・platform）がインストール済みならダウンロードしません。別バージョンの置き換えは `force=True`（mount 中なら先に unmount）。
-- ダウンロードは `~/.cache/carla-pack/blobs/<sha256>.tar.gz` にキャッシュします（`CARLA_PACK_CACHE_DIR`）。
-  数 GB の Pack は、キャッシュの tarball と展開後の Pack で **サイズの約 2 倍** のディスクを使います。
-- 接続が途中で切れても、受け取った位置から Range で再開します（最大 5 回）。再開しても全体の SHA-256 で検証します。
+- `packs_dir` must be readable by the CARLA server at the same path (the package's `Linux/CarlaUnreal/Packs`, `-carla-packs=<dir>`, or any folder if you mount it).
+- If the same pack (name, version, base release, platform) is already installed, nothing is downloaded. Replacing another version needs `force=True` (a mounted pack is unmounted first).
+- Downloads are cached in `~/.cache/carla-pack/blobs/<sha256>.tar.gz` (`CARLA_PACK_CACHE_DIR`).
+  A multi-gigabyte pack uses **about twice its size** on disk: the cached tarball plus the extracted pack.
+- If the connection drops, the download resumes from the received offset with a Range request (up to 5 times). A resumed download is still verified against the whole file's SHA-256.
 
-### 地図データを形式で引く
+### Getting map data by format
 
-Pack が持つ地図データを、マップ名と形式名でローカルのパスとして取り出せます。CARLA サーバは要りません（Pack はキャッシュに取得・検証・展開されます）。
+A pack's map data can be retrieved as local paths by map name and format name. No CARLA server is needed (the pack is fetched, verified and extracted into the cache).
 
-- どの Pack でも、`carla-pack.json` にある標準の形式（`opendrive` / `navmesh` / `traffic_manager` / `map_logic`）。
-- Pack が `Content/Config/roadgen_asset.json`（任意）を持っていれば、その形式も（roadgen の `carla_pack_assets` が書く: `lanelet2` / `autoware`（Lanelet2・点群地図・projector）/ `pointcloud` / `sumo` / `commonroad` / `clipgt` / `rdshq` / `gpudrive` / `womd` など）。
+- Every pack has the standard formats from `carla-pack.json` (`opendrive` / `navmesh` / `traffic_manager` / `map_logic`).
+- If the pack carries `Content/Config/roadgen_asset.json` (optional), its formats too (written by roadgen's `carla_pack_assets`: `lanelet2` / `autoware` (Lanelet2, point cloud map, projector) / `pointcloud` / `sumo` / `commonroad` / `clipgt` / `rdshq` / `gpudrive` / `womd`, etc.).
 
 ```bash
-carla-pack formats hakuturu583/carla-packs-test/RoadgenHighwayPack           # マップ × 形式の一覧
+carla-pack formats hakuturu583/carla-packs-test/RoadgenHighwayPack           # map × format table
 carla-pack data hakuturu583/carla-packs-test/RoadgenHighwayPack --format lanelet2
-carla-pack data RoadgenHighway --map --format autoware --file pointcloud_map  # フォルダの中の 1 ファイル
-carla-pack find RoadgenHighway --format lanelet2      # その形式を持つ Pack（公開時の索引で探す）
-carla-pack find SomeDataOnlyMap --assets              # asset ファイルにだけあるマップも探す
-carla-pack ls --formats                               # 一覧に形式の列を出す
-carla-pack formats ./Packs/RoadgenHighwayPack         # インストール済みの Pack フォルダや tarball も可
+carla-pack data RoadgenHighway --map --format autoware --file pointcloud_map  # one file inside a folder
+carla-pack find RoadgenHighway --format lanelet2      # packs with that format (searched in the index written at publish)
+carla-pack find SomeDataOnlyMap --assets              # also find maps that only the asset file names
+carla-pack ls --formats                               # add a formats column to the list
+carla-pack formats ./Packs/RoadgenHighwayPack         # an installed pack folder or a tarball also works
 ```
 
 ```python
@@ -96,62 +96,62 @@ from carla_pack_registry import Client, map_data, map_formats
 
 client = Client()
 release = client.find_map("RoadgenHighway", format="autoware")
-autoware_dir = client.map_data(release, "RoadgenHighway", "autoware")   # Autoware の map_path にそのまま
+autoware_dir = client.map_data(release, "RoadgenHighway", "autoware")   # usable directly as Autoware's map_path
 pcd = client.map_data(release, "RoadgenHighway", "autoware", file="pointcloud_map")
 client.formats(release)          # {map: {format: {type, path, files, origin}}}
-map_formats("/opt/carla/CarlaUnreal/Packs/RoadgenHighwayPack")          # インストール済みの Pack
+map_formats("/opt/carla/CarlaUnreal/Packs/RoadgenHighwayPack")          # an installed pack
 map_data("/opt/carla/CarlaUnreal/Packs/RoadgenHighwayPack", "RoadgenHighway", "opendrive")
 ```
 
-`carla-pack publish` は、マップごとの形式を `carla-packs.toml` のエントリ（`formats`）に書きます。`find --format` はこの索引で探すので、ダウンロードしません。
+`carla-pack publish` writes each map's formats into the entry in `carla-packs.toml` (`formats`). `find --format` searches this index, so it downloads nothing.
 
-### 設定
+### Settings
 
-| 項目 | 方法 |
+| Item | How |
 | --- | --- |
-| GitHub トークン | `CARLA_PACK_TOKEN` → `GH_TOKEN` → `GITHUB_TOKEN` → `carla-pack login` で保存したもの → `gh auth token` の順 |
-| 検索対象のリポジトリ | `--repo`（繰り返し可）、`CARLA_PACK_REPOS`（カンマ区切り）、`carla-pack repo add` |
-| 保存場所 | `CARLA_PACK_CONFIG_DIR`（既定 `~/.config/carla-pack/config.json`、パーミッション 600） |
-| GitHub Enterprise Server | `CARLA_PACK_GITHUB_API`（例 `https://ghe.example.com/api/v3`） |
+| GitHub token | in order: `CARLA_PACK_TOKEN` → `GH_TOKEN` → `GITHUB_TOKEN` → the one saved by `carla-pack login` → `gh auth token` |
+| Repositories to search | `--repo` (repeatable), `CARLA_PACK_REPOS` (comma-separated), `carla-pack repo add` |
+| Where settings are saved | `CARLA_PACK_CONFIG_DIR` (default `~/.config/carla-pack/config.json`, permissions 600) |
+| GitHub Enterprise Server | `CARLA_PACK_GITHUB_API` (e.g. `https://ghe.example.com/api/v3`) |
 
-`carla-pack login` は GitHub App（推奨: Contents 読み取り専用、Pack リポジトリにインストール）の client ID によるデバイスフローです
-（`--client-id` / `CARLA_PACK_GITHUB_CLIENT_ID`、OAuth App なら `--scope repo`）。`gh auth login` 済みなら不要です。
-CI では Pack リポジトリを読める fine-grained PAT か GitHub App のトークンを `CARLA_PACK_TOKEN` に渡してください
-（ワークフローの `GITHUB_TOKEN` は他のリポジトリを読めません）。
+`carla-pack login` is a device flow with the client ID of a GitHub App (recommended: Contents read-only, installed on the pack repositories)
+(`--client-id` / `CARLA_PACK_GITHUB_CLIENT_ID`; for an OAuth App, `--scope repo`). Not needed if you have run `gh auth login`.
+In CI, pass a fine-grained PAT or a GitHub App token that can read the pack repositories in `CARLA_PACK_TOKEN`
+(a workflow's `GITHUB_TOKEN` cannot read other repositories).
 
-## 配る（Pack リポジトリを作る側）
+## Distributing packs (creating a pack repository)
 
-[docs/pack-repository.md](docs/pack-repository.md) を参照してください。概要:
+See [docs/pack-repository.md](docs/pack-repository.md). In short:
 
-1. Private リポジトリを作り、[templates/pack-repo/carla-packs.toml](templates/pack-repo/carla-packs.toml) を置く。配りたい相手に Read 権限を付ける。
-2. バケット（R2 / S3）と読み取り専用の鍵の発行元を用意し、[鍵のローテーション workflow](templates/pack-repo/.github/workflows/) をコピーする。
-3. `carla-pack publish <Pack>.tar.gz` でアップロードとマニフェストへの追記を行い、commit / push する。
-   アップロード先は R2 / S3（carla-pack が直接マルチパートで送る）か Hugging Face（`pip install 'carla-pack-registry[huggingface]'`、`huggingface_hub` 経由）。
+1. Create a private repository and put [templates/pack-repo/carla-packs.toml](templates/pack-repo/carla-packs.toml) in it. Give Read permission to whoever should receive the packs.
+2. Set up a bucket (R2 / S3) and an issuer for read-only keys, and copy the [key rotation workflow](templates/pack-repo/.github/workflows/).
+3. Run `carla-pack publish <Pack>.tar.gz` to upload and append to the manifest, then commit and push.
+   The upload goes to R2 / S3 (carla-pack sends it directly as a multipart upload) or to Hugging Face (`pip install 'carla-pack-registry[huggingface]'`, through `huggingface_hub`).
 
-## 開発
+## Development
 
 ```bash
 uv venv && . .venv/bin/activate
 uv pip install "maturin>=1.9,<2" pytest "moto[server]==5.2.5" boto3 "huggingface_hub>=0.32"
-maturin develop            # Rust コアをビルドして carla_pack_registry をインストール
+maturin develop            # build the Rust core and install carla_pack_registry
 cargo fmt --check && cargo clippy --all-targets --features python -- -D warnings
-cargo test                 # Rust: SigV4 の公式テストベクタ、GitHub / S3 のモックサーバでの全フロー、展開の安全性
-pytest                     # Python: CARLA 側（mount / unmount の順序）と、moto（IAM 認証付き S3）+ 偽 GitHub での E2E
-maturin build --release    # wheel（abi3: Python 3.10 以上で共通）
+cargo test                 # Rust: the official SigV4 test vectors, every flow against mock GitHub / S3 servers, extraction safety
+pytest                     # Python: the CARLA side (mount / unmount order) and E2E with moto (S3 with IAM auth) + a fake GitHub
+maturin build --release    # wheel (abi3: one wheel for Python 3.10 and later)
 ```
 
-PyPI へのリリースは PR のラベルで行います。`release:major|minor|patch` を 1 つ付けてマージすると、バージョンの更新・タグ・GitHub Release・PyPI 公開まで
-`.github/workflows/release.yml` が行います（[docs/release.md](docs/release.md)）。
+PyPI releases are driven by PR labels. Merge a PR with exactly one `release:major|minor|patch` label and
+`.github/workflows/release.yml` bumps the version, tags, creates the GitHub Release and publishes to PyPI ([docs/release.md](docs/release.md)).
 
-## ドキュメント
+## Documentation
 
-| ドキュメント | 内容 |
+| Document | Contents |
 | --- | --- |
-| [docs/architecture.md](docs/architecture.md) | 仕組み、マニフェストと鍵ファイルの形式、旧 Registry サーバとの違い |
-| [docs/security.md](docs/security.md) | 信頼の境界、失効、残留リスク |
-| [docs/pack-repository.md](docs/pack-repository.md) | Pack リポジトリの作り方（R2 / AWS / その他の S3 互換） |
-| [docs/release.md](docs/release.md) | `carla-pack-registry` の PyPI リリース手順（ラベル駆動、Trusted Publishing） |
+| [docs/architecture.md](docs/architecture.md) | How it works, the manifest and key file formats, differences from the old Registry server |
+| [docs/security.md](docs/security.md) | Trust boundaries, revocation, residual risks |
+| [docs/pack-repository.md](docs/pack-repository.md) | How to create a pack repository (R2 / AWS / other S3-compatible storage) |
+| [docs/release.md](docs/release.md) | How `carla-pack-registry` is released to PyPI (label-driven, Trusted Publishing) |
 
-## ライセンス
+## License
 
-[Apache License 2.0](LICENSE) です。
+[Apache License 2.0](LICENSE).
