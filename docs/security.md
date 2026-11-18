@@ -1,51 +1,51 @@
-# セキュリティ
+# Security
 
-## 信頼の境界
+## Trust boundaries
 
-| 何を信じるか | 理由 |
+| What is trusted | Why |
 | --- | --- |
-| GitHub のリポジトリ権限 | 「Pack リポジトリを読める人 = 取得してよい人」と定義している。マニフェストも鍵もこの権限でしか読めない |
-| Pack リポジトリへの書き込み権限を持つ人 | マニフェスト（どこから・どの SHA-256 で取るか）と鍵の workflow を変更できる。リポジトリの Write 権限は Pack の公開者に限る |
-| ストレージの鍵の権限 | 一時鍵は `object-read-only`（R2）/ セッションポリシーで `s3:GetObject`（AWS）、いずれもプレフィックス限定 |
+| GitHub repository permissions | "Can read the pack repository = may fetch" is the definition. The manifest and key can only be read with this permission |
+| People with write access to the pack repository | They can change the manifest (where to fetch from, with which SHA-256) and the key workflow. Limit repository Write permission to pack publishers |
+| Permissions of the storage key | The temporary key is `object-read-only` (R2) / `s3:GetObject` by a session policy (AWS), both limited to the prefix |
 
-利用者側は、マニフェストの SHA-256・サイズと、Pack 自身の `carla-pack.json` の全ファイルのハッシュを検証してから配置します。
-ストレージ側のファイルが差し替えられても、マニフェストと一致しなければ何もインストールしません。
+The client verifies the manifest's SHA-256 and size, and the hashes of every file in the pack's own `carla-pack.json`, before installing.
+Even if a file in storage is replaced, nothing is installed unless it matches the manifest.
 
-## 対策の一覧
+## Countermeasures
 
-| 脅威 | 対策 | 確認 |
+| Threat | Countermeasure | Verified by |
 | --- | --- | --- |
-| 権限のない人の取得 | マニフェストと鍵は GitHub API でしか取れず、読めなければ 404。ストレージは鍵なしでは拒否 | `tests/flow.rs` `no_read_access_means_no_pack`、`python/tests/test_e2e.py` |
-| GitHub トークンの漏洩（ストレージ側へ） | トークンは GitHub API のホストにだけ送る。asset のリダイレクト先（別ホスト）には `Authorization` を付けない（reqwest がオリジンをまたぐリダイレクトで除去）。S3 には SigV4 だけ | `tests/flow.rs`（リダイレクト先で Authorization なしを要求）、E2E の `leaked == []` |
-| ストレージ上のファイルの改ざん・取り違え | マニフェストの SHA-256 / サイズを照合。不一致なら一時ファイルを削除しエラー（`checksum_mismatch`） | `tampered_downloads_are_discarded` |
-| マニフェストと中身の食い違い | 展開後の `carla-pack.json` の名前・バージョン・base release・platform がマニフェストと一致しなければ拒否 | `tests/pack.rs` |
-| 悪意ある tarball（`..`、絶対パス、リンク、未記載ファイル、重複メンバー） | 単一トップフォルダの通常ファイルとディレクトリのみ受け付け、全ファイルを manifest と照合。失敗時は packs_dir に何も残さない | `tests/pack.rs` |
-| 公開リポジトリから鍵を配ってしまう | 鍵の workflow はリポジトリが Private でなければ失敗する | `templates/pack-repo/.github/workflows/*` |
-| 鍵の権限が広すぎる | R2 は `object-read-only` + prefix、AWS はセッションポリシーで `s3:GetObject` + prefix。元の権限（R2 の親トークン、AWS のロール）を超えない | — |
-| 長期鍵の流出 | 配るのは 12 時間で切れる一時鍵。発行元の秘密（Cloudflare API トークン）は Actions secret、AWS は OIDC で秘密なし | — |
-| 期限切れの鍵 | 期限まで 2 分未満の鍵は使わず、原因（workflow が止まっている）を示すエラー | `expired_or_missing_credentials_are_reported` |
-| エンドポイントの差し替え（SSRF 的な誘導） | `endpoint` は https のオリジンのみ（http は localhost だけ）、パス・クエリ・ユーザー情報を禁止。キーは正規化された相対パスのみ | `src/manifest.rs` のテスト |
-| Hugging Face 上の公開 Pack | トークン（GitHub・Hugging Face とも）を一切送らない匿名取得。リポジトリ（`main` など）の中身が書き換えられても、マニフェストの SHA-256 と一致しなければインストールしない。公開リポジトリなので、置いた Pack は誰でも取得できる前提 | `public_packs_come_from_hugging_face_without_any_token` |
-| ローカルの資格情報 | 保存するトークンは `config.json`（600）。ストレージの鍵はメモリにだけ置き、ログやエラーに出さない（`Debug` でも秘匿） | `src/sigv4.rs` のテスト |
+| Fetching without permission | The manifest and key are only available through the GitHub API, which returns 404 if not readable. Storage refuses requests without a key | `tests/flow.rs` `no_read_access_means_no_pack`, `python/tests/test_e2e.py` |
+| GitHub token leaking (to storage) | The token is only sent to the GitHub API host. No `Authorization` is attached to the asset's redirect target (another host; reqwest strips it on cross-origin redirects). S3 only gets SigV4 | `tests/flow.rs` (requires no Authorization at the redirect target), the E2E's `leaked == []` |
+| Tampered or mixed-up files in storage | Checked against the manifest's SHA-256 / size. On a mismatch the temporary file is deleted and an error raised (`checksum_mismatch`) | `tampered_downloads_are_discarded` |
+| Manifest and contents disagreeing | Refused unless the extracted `carla-pack.json`'s name, version, base release and platform match the manifest | `tests/pack.rs` |
+| Malicious tarball (`..`, absolute paths, links, unlisted files, duplicate members) | Only regular files and directories under a single top folder are accepted, and every file is checked against the manifest. Nothing is left in packs_dir on failure | `tests/pack.rs` |
+| Handing out keys from a public repository | The key workflow fails unless the repository is private | `templates/pack-repo/.github/workflows/*` |
+| Key permissions too broad | R2: `object-read-only` + prefix; AWS: `s3:GetObject` + prefix by a session policy. Never beyond the source's permissions (R2's parent token, AWS's role) | — |
+| Long-lived key leaking | What is handed out is a temporary key expiring in 12 hours. The issuer's secret (Cloudflare API token) is an Actions secret; AWS uses OIDC with no secret | — |
+| Expired key | A key with less than 2 minutes left is not used, and the error names the cause (the workflow has stopped) | `expired_or_missing_credentials_are_reported` |
+| Endpoint substitution (SSRF-like redirection) | `endpoint` must be an https origin (http only for localhost), with no path, query or user info. Keys must be normalized relative paths | tests in `src/manifest.rs` |
+| Public packs on Hugging Face | Anonymous fetch that sends no token at all (neither GitHub nor Hugging Face). Even if the repository's contents (`main`, etc.) are rewritten, nothing is installed unless it matches the manifest's SHA-256. As a public repository, anything placed there is assumed fetchable by anyone | `public_packs_come_from_hugging_face_without_any_token` |
+| Local credentials | The saved token is in `config.json` (600). The storage key is kept only in memory and never appears in logs or errors (hidden even in `Debug`) | tests in `src/sigv4.rs` |
 
-## 失効と反映の遅延
+## Revocation and propagation delay
 
-- **人を外す**: Pack リポジトリ（または Team）から外せば、以後マニフェストも新しい鍵も取れません。
-  ただし **すでに取得した鍵は期限（最大 12 時間）まで有効** です。旧版の署名付き URL（5 分）より長くなります。
-- **すぐに止めたい**: 鍵の元を無効にします。
-  - R2: 一時鍵の親になっている R2 API トークンを削除 / ロール（ローテーション）します。一時鍵は親の権限を超えられないので、そこから作った一時鍵も使えなくなる想定です（**実環境では未確認**。運用前に確かめてください）。
-    新しい親トークンの access key ID を `R2_PARENT_ACCESS_KEY_ID` に設定して workflow を手動実行してください。
-  - AWS: IAM ロールの「Revoke active sessions」で、それ以前に発行したセッションを無効にできます。
-- 期限は workflow の `TTL_SECONDS` / `role-duration-seconds` で短くできます（その場合は cron も短く）。
+- **Removing a person**: once removed from the pack repository (or team), they can no longer fetch the manifest or new keys.
+  However, **a key already fetched stays valid until it expires (up to 12 hours)**. That is longer than the old version's signed URLs (5 minutes).
+- **Stopping access immediately**: disable the key source.
+  - R2: delete / roll (rotate) the R2 API token that is the temporary key's parent. A temporary key cannot exceed its parent's permissions, so temporary keys made from it are expected to stop working too (**not verified in a real environment**; check this before relying on it).
+    Set the new parent token's access key ID in `R2_PARENT_ACCESS_KEY_ID` and run the workflow manually.
+  - AWS: "Revoke active sessions" on the IAM role invalidates sessions issued before that point.
+- The lifetime can be shortened with the workflow's `TTL_SECONDS` / `role-duration-seconds` (shorten the cron interval as well).
 
-## 残留リスク・既知の制限
+## Residual risks and known limitations
 
-- **鍵はリポジトリを読める全員が取得でき、他人に渡すこともできます。** 渡された人は期限まで、そのプレフィックスの Pack をすべて読めます。
-  旧版の署名付き URL と同じ性質ですが、範囲（プレフィックス全体）と期間（12 時間）が広くなっています。
-  共有範囲の違う Pack は、リポジトリとプレフィックス（R2 なら別の親トークンでも可）を分けてください。
-- **監査ログは粗くなります。** GitHub は Release asset のダウンロード者を記録しません。ストレージのアクセスログには一時鍵の ID しか残りません。
-- **トークンの権限**: `gh auth token` や OAuth App のトークン（`repo` スコープ）は、Pack リポジトリ以外にも広い権限を持ちます。
-  carla-pack が使うのは読み取りだけですが、専用にするなら GitHub App（Contents: read-only）か fine-grained PAT（対象リポジトリの Contents: read）を使ってください。
-- **鍵の置き換えの瞬間**: `gh release upload --clobber` は削除してからアップロードするため、ごく短い間 asset が無くなります。その間の取得は「再試行してください」というエラーになります。
-- **R2 の公開アクセス**: バケットに r2.dev やカスタムドメインの公開アクセスを設定すると、この仕組みを迂回して誰でも読めます。Private 運用では無効にしてください。
-- Pack リポジトリの Write 権限を持つ人（とそのワークフロー）は、マニフェストを書き換えて別のファイルを指させることができます。SHA-256 で固定した lock ファイルを使う利用者は影響を受けません。
+- **Everyone who can read the repository can fetch the key, and can pass it on.** Whoever receives it can read every pack under that prefix until it expires.
+  This is the same nature as the old version's signed URLs, but the scope (the whole prefix) and duration (12 hours) are wider.
+  Put packs with different audiences in separate repositories and prefixes (for R2, a separate parent token also works).
+- **Audit logs are coarser.** GitHub does not record who downloads a Release asset. The storage access log only records the temporary key's ID.
+- **Token permissions**: `gh auth token` and OAuth App tokens (`repo` scope) carry broad permissions beyond the pack repositories.
+  carla-pack only reads, but for a dedicated token use a GitHub App (Contents: read-only) or a fine-grained PAT (Contents: read on the target repositories).
+- **The moment the key is replaced**: `gh release upload --clobber` deletes before uploading, so the asset is missing for a very short time. A fetch in that window gets a "please retry" error.
+- **Public access on R2**: enabling public access on the bucket through r2.dev or a custom domain bypasses this mechanism and lets anyone read it. Disable it for private use.
+- People with Write permission on the pack repository (and their workflows) can rewrite the manifest to point at another file. Users with a lock file pinned by SHA-256 are not affected.

@@ -1,92 +1,92 @@
-# アーキテクチャ
+# Architecture
 
-## 考え方
+## Idea
 
-「この人はこの Pack をダウンロードしてよいか」を判断する主体を、自前のサーバから **GitHub のリポジトリ権限** に移しました。
+The decision "may this person download this pack?" has moved from our own server to **GitHub repository permissions**.
 
-- Pack リポジトリ（GitHub、Private）を読める ⇔ その Pack を取得できる。
-- そのために必要な情報（どこに・どの SHA-256 で置いてあるか、読み取り用の鍵）は、すべてリポジトリの中に置く。
-- クライアントは利用者自身の GitHub トークンでそれを読み、ストレージから直接ダウンロードする。
+- Can read the pack repository (GitHub, private) ⇔ can fetch its packs.
+- Everything needed for that (where each pack is, its SHA-256, the read key) lives inside the repository.
+- The client reads it with the user's own GitHub token and downloads directly from storage.
 
-中央のサーバ・データベース・秘密情報の保管場所はありません。
+There is no central server, database or secret store.
 
-## 流れ
+## Flow
 
 ```
-利用者の carla-pack / Python                 GitHub                          S3 互換ストレージ
-──────────────────────────                  ──────                          ────────────────
-1. GET /repos/{o}/{r}/contents/carla-packs.toml ─► 読めなければ 404（終了）
-   ← マニフェスト（storage と [[pack]]）
-2. 参照（OWNER/REPO/PACK@VER）またはマップ名から
-   リリースを 1 つに決める（新しい順、曖昧ならエラー）
+User's carla-pack / Python                    GitHub                          S3-compatible storage
+──────────────────────────                    ──────                          ─────────────────────
+1. GET /repos/{o}/{r}/contents/carla-packs.toml ─► 404 if not readable (stop)
+   ← manifest (storage and [[pack]])
+2. From a reference (OWNER/REPO/PACK@VER) or a map name,
+   settle on one release (newest first; ambiguity is an error)
 3. GET /repos/{o}/{r}/releases/tags/carla-pack-credentials
-   GET .../releases/assets/{id}  ─► 302（別ホストの署名付き URL。トークンは送らない）
-   ← credentials.json（読み取り専用・期限付き）
-4. GET {endpoint}/{bucket}/{prefix}{key}  （SigV4、UNSIGNED-PAYLOAD）─────────────────► 鍵の権限で判定
-   ← tarball（ストリームで SHA-256 を計算しながら保存。切断されたら Range: bytes=N- で続きから）
-5. サイズと SHA-256 をマニフェストと照合 → キャッシュ（blobs/<sha256>.tar.gz）
-6. 展開して carla-pack.json の全ファイルを照合、名前・バージョン・base release・platform がマニフェストと一致することを確認
-7. <packs_dir>/<name> に配置 → （任意）carla.Client.mount_content_pack
+   GET .../releases/assets/{id}  ─► 302 (signed URL on another host; the token is not sent)
+   ← credentials.json (read-only, time-limited)
+4. GET {endpoint}/{bucket}/{prefix}{key}  (SigV4, UNSIGNED-PAYLOAD) ────────────────────► checked against the key's permissions
+   ← tarball (saved while streaming SHA-256; on a disconnect, continued with Range: bytes=N-)
+5. Check size and SHA-256 against the manifest → cache (blobs/<sha256>.tar.gz)
+6. Extract, check every file against carla-pack.json, and confirm name, version, base release and platform match the manifest
+7. Install into <packs_dir>/<name> → (optional) carla.Client.mount_content_pack
 ```
 
-鍵を作る側（Pack リポジトリの GitHub Actions、6 時間ごと）:
+The key issuer (the pack repository's GitHub Actions, every 6 hours):
 
 ```
-R2:  Cloudflare API（secret の API トークン）→ POST /accounts/{id}/r2/temp-access-credentials
-     （object-read-only、prefix 限定、12 時間）
-AWS: GitHub OIDC → sts:AssumeRoleWithWebIdentity（12 時間、セッションポリシーで s3:GetObject と prefix に限定）
-→ credentials.json を Release "carla-pack-credentials" の asset として置き換える（Private でなければ中止）
+R2:  Cloudflare API (API token in a secret) → POST /accounts/{id}/r2/temp-access-credentials
+     (object-read-only, limited to the prefix, 12 hours)
+AWS: GitHub OIDC → sts:AssumeRoleWithWebIdentity (12 hours, limited to s3:GetObject and the prefix by a session policy)
+→ replace credentials.json as an asset of the Release "carla-pack-credentials" (aborts unless the repository is private)
 ```
 
-## 形式
+## Formats
 
-### `carla-packs.toml`（Pack リポジトリのルート）
+### `carla-packs.toml` (root of the pack repository)
 
 ```toml
 schema = 1
 
 [storage]
-endpoint = "https://<account>.r2.cloudflarestorage.com"   # https のみ（http は localhost だけ）。パスなしのオリジン
-region = "auto"                                          # 既定 auto（R2）。S3 はバケットのリージョン
+endpoint = "https://<account>.r2.cloudflarestorage.com"   # https only (http only for localhost). An origin without a path
+region = "auto"                                          # default auto (R2). For S3, the bucket's region
 bucket = "carla-packs"
-prefix = "packs/"                                        # 任意。"/" で終わる相対パス
-addressing = "path"                                      # path（既定）| virtual
-credentials = "github-release"                           # github-release | anonymous（公開バケット）
-credentials_tag = "carla-pack-credentials"               # 任意
-# type = "s3" は省略可（既定）。公開 Pack を Hugging Face に置く場合:
+prefix = "packs/"                                        # optional. A relative path ending in "/"
+addressing = "path"                                      # path (default) | virtual
+credentials = "github-release"                           # github-release | anonymous (public bucket)
+credentials_tag = "carla-pack-credentials"               # optional
+# type = "s3" may be omitted (default). For public packs on Hugging Face:
 # type = "huggingface" / repo = "OWNER/NAME" / repo_type = "dataset" | "model" / revision = "main" / prefix
 
 [[pack]]
-name = "NishishinjukuPack"            # CARLA の Pack 名（英字始まりの英数字と _）
+name = "NishishinjukuPack"            # CARLA pack name (letters, digits and _, starting with a letter)
 version = "1.2.0"
 base_release = "carla-0.10.0-Linux"
 platform = "Linux"
-key = "NishishinjukuPack-1.2.0-carla-0.10.0-Linux.tar.gz"   # prefix からの相対キー
-sha256 = "…"                          # tarball の SHA-256（小文字 16 進 64 桁）
+key = "NishishinjukuPack-1.2.0-carla-0.10.0-Linux.tar.gz"   # key relative to the prefix
+sha256 = "…"                          # SHA-256 of the tarball (64 lowercase hex digits)
 size = 3221225472
 maps = ["NishishinjukuMap"]
-description = "…"                     # 任意
-yanked = false                        # 任意。true にすると選ばれない（sha256 で固定した lock からは取得可）
+description = "…"                     # optional
+yanked = false                        # optional. true means it is not selected (still fetchable from a lock pinned by sha256)
 
-[pack.formats]                        # 任意。マップごとの地図データ形式（publish が書く。下の「地図データの形式」）
+[pack.formats]                        # optional. Map data formats per map (written by publish; see "Map data formats" below)
 NishishinjukuMap = ["autoware", "lanelet2", "navmesh", "opendrive", "sumo"]
 ```
 
-- 未知のキーはエラーにします（タイプミスの見逃し防止）。
-- `(name, version, base_release, platform)` の重複はエラー。`carla-pack publish` は既存のものを置き換えず追記だけします。
-- 選択: 条件（名前・バージョン・base release・platform・sha256）に合うもののうち最新版。最新版が複数の base release / platform にあれば曖昧としてエラー。
-  バージョンは区切り（`.` `-` `+` `_`）ごとに数値比較し、`1.0.0` は `1.0.0-rc1` より新しいとみなします。
-- マップ名は `/Game/.../Town01` のようなパスでも末尾の名前で照合します。
-- `formats` はマップ名 → 形式名の一覧です。`find --format` はこの索引で探し、`find --assets` はここにだけ現れるマップ名（CARLA のレベルを持たないデータだけのマップ）も対象にします。
-  `formats` を書かずに公開した過去のリリースは、形式では見つからず、マップ名でだけ見つかります（取得後の `carla-pack formats` は過去のリリースでも使えます）。
-  `formats` を含むマニフェストは、このキーを知らない古い carla-pack（`formats` 追加前）では読めません。
+- Unknown keys are an error (so typos are not missed).
+- A duplicate `(name, version, base_release, platform)` is an error. `carla-pack publish` only appends; it never replaces an existing entry.
+- Selection: the latest version among the entries matching the conditions (name, version, base release, platform, sha256). If the latest version exists for several base releases / platforms, it is ambiguous and an error.
+  Versions are compared numerically per separator (`.` `-` `+` `_`), and `1.0.0` counts as newer than `1.0.0-rc1`.
+- A map name given as a path such as `/Game/.../Town01` is matched by its last component.
+- `formats` lists format names per map name. `find --format` searches this index, and `find --assets` also covers map names that appear only here (data-only maps without a CARLA level).
+  Releases published before `formats` was written are not found by format, only by map name (`carla-pack formats` still works on them once fetched).
+  A manifest containing `formats` cannot be read by an older carla-pack that does not know this key (from before `formats` was added).
 
-### 地図データの形式
+### Map data formats
 
-Pack が持つ地図データを、マップ名と形式名で引けます。CARLA サーバは要りません。
+A pack's map data can be looked up by map name and format name. No CARLA server is needed.
 
-- **標準の形式**: どの Pack でも、`carla-pack.json` の各マップの `xodr` / `nav` / `tm` / `map_logic` から作ります。形式名は `opendrive` / `navmesh` / `traffic_manager`（フォルダ）/ `map_logic`。
-- **asset ファイル（任意）**: Pack が `Content/Config/roadgen_asset.json` を持っていれば、その形式も加えます。roadgen の `carla_pack_assets` が書くファイルで、Lanelet2 と点群地図（Autoware）、SUMO、CommonRoad、ClipGT、RDS-HQ、GPUDrive、WOMD などを `Content/HDMaps/<map>/` に入れたことを示します。持たない Pack は標準の形式だけです。同じ形式名は標準の方を使います。
+- **Standard formats**: every pack has them, built from each map's `xodr` / `nav` / `tm` / `map_logic` in `carla-pack.json`. The format names are `opendrive` / `navmesh` / `traffic_manager` (a folder) / `map_logic`.
+- **Asset file (optional)**: if a pack carries `Content/Config/roadgen_asset.json`, its formats are added. roadgen's `carla_pack_assets` writes this file; it records that Lanelet2 and a point cloud map (Autoware), SUMO, CommonRoad, ClipGT, RDS-HQ, GPUDrive, WOMD, etc. were put in `Content/HDMaps/<map>/`. A pack without it has only the standard formats. When both name a format, the standard one is used.
 
 ```json
 {
@@ -105,11 +105,11 @@ Pack が持つ地図データを、マップ名と形式名で引けます。CAR
 }
 ```
 
-- パスはすべて Pack フォルダ（`carla-pack.json` のあるフォルダ）からの正規化された相対パスで、外に出るパスはエラーです。
-- ビルド済みの Pack では、asset ファイルが指すファイルはすべて `carla-pack.json` の `files` に載っていなければなりません（インストール時の SHA-256 照合の対象であることの確認）。載っていなければ asset ファイルごと拒否します。
-- `schema` が 1 以外ならエラーです。
+- Every path is a normalized path relative to the pack folder (the folder holding `carla-pack.json`); a path that leaves it is an error.
+- In a built pack, every file the asset file points to must be listed in `files` of `carla-pack.json` (confirming it is covered by the SHA-256 check at install). Otherwise the whole asset file is refused.
+- A `schema` other than 1 is an error.
 
-### `credentials.json`（Release asset）
+### `credentials.json` (Release asset)
 
 ```json
 {
@@ -121,37 +121,37 @@ Pack が持つ地図データを、マップ名と形式名で引けます。CAR
 }
 ```
 
-`session_token` と `expires_at` は任意（長期鍵の場合は省略）。`expires_at` は RFC 3339（オフセット付きも可）。
-期限まで 2 分を切った鍵は使わず、「鍵の workflow が動いていない」というエラーにします。
+`session_token` and `expires_at` are optional (omitted for a long-lived key). `expires_at` is RFC 3339 (an offset is allowed).
+A key with less than 2 minutes left is not used; the error says the key workflow is not running.
 
-## コード
+## Code
 
-| ファイル | 役割 |
+| File | Role |
 | --- | --- |
-| `src/github.rs` | アクセス確認: マニフェストと鍵を GitHub API から読む。404 → `no_access` |
-| `src/manifest.rs` | `carla-packs.toml` の型・検証、参照 `OWNER/REPO/PACK[@VER]`、リリースの選択 |
-| `src/sigv4.rs` | AWS Signature V4（ヘッダ署名、`UNSIGNED-PAYLOAD`）。AWS の公式テストベクタで検証 |
-| `src/hf.rs` | Hugging Face の公開リポジトリからの取得（匿名の `resolve` URL、Range で再開） |
-| `src/s3.rs` | GET（Range で再開）/ HEAD / PUT、64 MiB 超はマルチパートアップロード（失敗時は abort）。path / virtual-host 形式 |
-| `src/client.rs` | `resolve` / `find_map` / `fetch`（キャッシュと検証）/ `install` / `unpack` / `formats` / `map_data` / `publish` |
-| `src/pack.rs` | tarball の安全な展開、`carla-pack.json` による全ファイル照合、配置 |
-| `src/formats.rs` | 地図データの形式: `carla-pack.json` の標準の形式と `roadgen_asset.json` の形式の読み取り、索引、パスの解決 |
-| `src/store.rs` | トークンの探索、保存済み設定（ログイン、検索対象リポジトリ）、キャッシュの場所 |
-| `src/auth.rs` | GitHub デバイスフロー（client ID のみ、client secret 不要） |
-| `src/python.rs` | PyO3 バインディング（`carla_pack_registry._core`） |
-| `python/carla_pack_registry/deploy.py` | `deploy_pack` / `ensure_map`: CARLA サーバへの mount / unmount |
-| `python/carla_pack_registry/publish.py` | `publish`: 確認（Rust の `plan_publish`）→ アップロード（S3 は Rust、Hugging Face は `huggingface_hub`）→ 追記（`append_entry`） |
-| `python/carla_pack_registry/cli.py` | `carla-pack` コマンド |
-| `templates/pack-repo/` | Pack リポジトリ用のマニフェスト雛形と鍵ローテーション workflow |
+| `src/github.rs` | Access check: reads the manifest and key from the GitHub API. 404 → `no_access` |
+| `src/manifest.rs` | Types and validation of `carla-packs.toml`, the reference `OWNER/REPO/PACK[@VER]`, release selection |
+| `src/sigv4.rs` | AWS Signature V4 (header signing, `UNSIGNED-PAYLOAD`). Verified with AWS's official test vectors |
+| `src/hf.rs` | Fetching from public Hugging Face repositories (anonymous `resolve` URLs, resumed with Range) |
+| `src/s3.rs` | GET (resumed with Range) / HEAD / PUT; multipart upload above 64 MiB (aborted on failure). Path / virtual-host addressing |
+| `src/client.rs` | `resolve` / `find_map` / `fetch` (cache and verification) / `install` / `unpack` / `formats` / `map_data` / `publish` |
+| `src/pack.rs` | Safe tarball extraction, checking every file against `carla-pack.json`, installation |
+| `src/formats.rs` | Map data formats: reading the standard formats from `carla-pack.json` and the formats from `roadgen_asset.json`, the index, path resolution |
+| `src/store.rs` | Token lookup, saved settings (login, repositories to search), cache location |
+| `src/auth.rs` | GitHub device flow (client ID only, no client secret) |
+| `src/python.rs` | PyO3 bindings (`carla_pack_registry._core`) |
+| `python/carla_pack_registry/deploy.py` | `deploy_pack` / `ensure_map`: mount / unmount on the CARLA server |
+| `python/carla_pack_registry/publish.py` | `publish`: check (Rust `plan_publish`) → upload (S3 in Rust, Hugging Face via `huggingface_hub`) → append (`append_entry`) |
+| `python/carla_pack_registry/cli.py` | The `carla-pack` command |
+| `templates/pack-repo/` | Manifest template and key rotation workflows for pack repositories |
 
-## 旧 Registry サーバ（Workers / Lambda）との違い
+## Differences from the old Registry server (Workers / Lambda)
 
-| | 旧: Registry サーバ | 新: GitHub + S3 直接 |
+| | Old: Registry server | New: GitHub + direct S3 |
 | --- | --- | --- |
-| アクセス判定 | サーバが GitHub の Org / Team メンバーシップを引いて ACL を判定 | GitHub がリポジトリの Read 権限で判定（読めなければ 404） |
-| 共有の単位 | バケット単位の ACL（user / org / team） | リポジトリ（とバケットのプレフィックス）単位。Team 単位で配るならリポジトリに Team を追加 |
-| ダウンロード | サーバが署名した 5 分の URL | 利用者が 12 時間の読み取り専用鍵で SigV4 署名 |
-| 秘密情報 | サーバが全バケットの鍵（暗号化）と STS 用 IAM キーを保持 | 中央には無い。鍵の元（Cloudflare API トークン / OIDC ロール）は各 Pack リポジトリの Actions にだけある |
-| 一覧 | バケットのライブ一覧 | マニフェストに明示的に公開したものだけ（SHA-256 固定、不変） |
-| 運用 | Workers + D1 または Lambda + DynamoDB、WAF、Terraform | なし（各 Pack リポジトリの scheduled workflow のみ） |
-| 監査 | サーバの監査ログ | GitHub の権限変更履歴とストレージのアクセスログ（鍵 ID 単位） |
+| Access decision | The server looked up GitHub org / team membership and evaluated an ACL | GitHub decides by Read permission on the repository (404 if not readable) |
+| Unit of sharing | Per-bucket ACL (user / org / team) | Per repository (and bucket prefix). To share with a team, add the team to the repository |
+| Download | 5-minute URL signed by the server | The user signs with SigV4 using a 12-hour read-only key |
+| Secrets | The server held every bucket's key (encrypted) and an IAM key for STS | None centrally. The key sources (Cloudflare API token / OIDC role) exist only in each pack repository's Actions |
+| Listing | Live listing of the bucket | Only what was explicitly published in the manifest (pinned by SHA-256, immutable) |
+| Operations | Workers + D1 or Lambda + DynamoDB, WAF, Terraform | None (only each pack repository's scheduled workflow) |
+| Auditing | The server's audit log | GitHub's permission change history and the storage access log (per key ID) |
