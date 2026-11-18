@@ -18,9 +18,9 @@ classifiers = [
 keywords = ["carla", "content-pack", "simulator", "huggingface", "s3"]
 
 [project.urls]
-Homepage = "https://github.com/hakuturu583/carla_content_pack_registry"
-Repository = "https://github.com/hakuturu583/carla_content_pack_registry"
-Issues = "https://github.com/hakuturu583/carla_content_pack_registry/issues"
+Homepage = "https://github.com/autowarefoundation/carla_content_pack_registry"
+Repository = "https://github.com/autowarefoundation/carla_content_pack_registry"
+Issues = "https://github.com/autowarefoundation/carla_content_pack_registry/issues"
 
 [project.optional-dependencies]
 # Uploading packs to the Hugging Face Hub (downloads need nothing extra).

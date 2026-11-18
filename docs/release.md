@@ -22,7 +22,7 @@ wheel のテストは extra なしで行うので、moto を使う E2E と Huggi
 
 ## 初回だけ必要な設定
 
-1. PyPI（https://pypi.org/manage/account/publishing/）で **pending publisher** を追加します: PyPI project name `carla-pack-registry`、owner `hakuturu583`、repository `carla_content_pack_registry`、workflow `release.yml`、environment `pypi`。
+1. PyPI（https://pypi.org/manage/account/publishing/）で **pending publisher** を追加します: PyPI project name `carla-pack-registry`、owner `autowarefoundation`、repository `carla_content_pack_registry`、workflow `release.yml`、environment `pypi`。
 2. GitHub の Settings → Environments に `pypi` を作ります（必要なら Required reviewers を付けると、公開前に承認を挟めます）。
 
 設定前に release ラベルの PR をマージすると、タグと GitHub Release までは作られ、publish ジョブだけが失敗します。wheel と sdist はその実行の artifact に残るので、設定後に「Re-run failed jobs」で公開できます。
