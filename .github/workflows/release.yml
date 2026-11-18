@@ -15,7 +15,7 @@
 # workflow runs.
 #
 # PyPI authentication is Trusted Publishing, so there is no token in the secrets. It is
-# configured once on PyPI (pending publisher: owner `hakuturu583`, repository
+# configured once on PyPI (pending publisher: owner `autowarefoundation`, repository
 # `carla_content_pack_registry`, workflow `release.yml`, environment `pypi`); until then
 # the publish job fails and the artifacts stay downloadable from the run. See
 # docs/release.md. A version can never be replaced on PyPI, so the tagged commit is
