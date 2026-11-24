@@ -14,6 +14,6 @@ team_drive = "0ABcdEfGhIjKlUk9PVA"     # the shared drive's ID (from its drive.g
 # root_folder_id = "1a2b3c..."        # optional: a folder in it, or a folder shared with the users
 prefix = "packs/"
 
-# Publish a pack (uploads with rclone, checks Drive's SHA-256, then adds its entry here):
+# Publish a pack (uploads with rclone, then adds its entry here):
 #   carla-pack drive login --write      # a remote with write access (or a service account, see the docs)
 #   carla-pack publish <Pack>.tar.gz

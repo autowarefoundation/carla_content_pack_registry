@@ -129,15 +129,12 @@ def cmd_whoami(args: argparse.Namespace) -> int:
 
 def cmd_drive_login(args: argparse.Namespace) -> int:
     binary, default_remote, service_account = _core.rclone_settings()
-    remote = (args.remote or default_remote).rstrip(":")
-    if shutil.which(binary) is None and not Path(binary).is_file():
-        raise CliError(
-            f"rclone was not found ({binary}): install it (https://rclone.org/install/) or set CARLA_PACK_RCLONE"
-        )
+    remote = args.remote.rstrip(":") if args.remote else default_remote
     if service_account and not args.remote:
         print(f"note: CARLA_PACK_RCLONE_SERVICE_ACCOUNT_FILE is set, so carla-pack reads Drive as {service_account}, "
               "not through this remote", file=sys.stderr)
-    options = [f"scope={'drive' if args.write else 'drive.readonly'}"]
+    scope = "drive" if args.write else "drive.readonly"
+    options = [f"scope={scope}"]
     client_id = args.client_id or os.environ.get("CARLA_PACK_DRIVE_CLIENT_ID")
     client_secret = args.client_secret or os.environ.get("CARLA_PACK_DRIVE_CLIENT_SECRET")
     if client_id:
@@ -152,10 +149,15 @@ def cmd_drive_login(args: argparse.Namespace) -> int:
     elif args.headless:
         options.append("config_is_local=false")
     # rclone asks in the browser (or, headless, for the `rclone authorize` output) itself.
-    done = subprocess.run([binary, "config", "create", remote, "drive", *options], check=False)
+    try:
+        done = subprocess.run([binary, "config", "create", remote, "drive", *options], check=False)
+    except FileNotFoundError:
+        raise CliError(
+            f"rclone was not found ({binary}): install it (https://rclone.org/install/) or set CARLA_PACK_RCLONE"
+        ) from None
     if done.returncode != 0:
         raise CliError(f"`rclone config create {remote} drive` failed (exit {done.returncode})")
-    print(f"rclone remote {remote} is set up for Google Drive ({options[0]}).")
+    print(f"rclone remote {remote} is set up for Google Drive (scope {scope}).")
     if remote != default_remote:
         print(f"carla-pack reads through {default_remote}: set CARLA_PACK_RCLONE_REMOTE={remote} to use this one.")
     return 0
@@ -335,8 +337,8 @@ def cmd_credentials(args: argparse.Namespace) -> int:
 
     def human() -> None:
         print(f"{s['repo']}: {s['storage']} ({s['mode']})")
-        if s.get("rclone"):
-            print(f"  read as    : {s['rclone']} (it can read the drive)")
+        if s.get("read_as"):
+            print(f"  read as    : {s['read_as']} (it can read the storage)")
         if s.get("access_key_id"):
             print(f"  access key : {s['access_key_id']}")
             print(f"  expires at : {s.get('expires_at') or 'never (long-lived key)'}")

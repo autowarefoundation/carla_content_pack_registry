@@ -113,7 +113,7 @@ so there is no storage key, no key workflow and nothing to rotate. Removing some
 
 ```
 carla-pack ──(1) GitHub API: carla-packs.toml (private repository) ──► GitHub
-           ──(2) rclone lsjson / cat, as the user's Google account ───► Google Drive shared drive
+           ──(2) rclone cat, as the user's Google account ──────────► Google Drive shared drive
            ──(3) SHA-256 and carla-pack.json checked → install → mount
 ```
 
@@ -140,7 +140,7 @@ team_drive = "<shared drive ID>"
 prefix = "packs/"
 ```
 
-Each user, once (rclone v1.64 or later on PATH, or in `CARLA_PACK_RCLONE`):
+Each user, once (a current rclone on PATH, or in `CARLA_PACK_RCLONE`):
 
 ```bash
 carla-pack drive login            # creates the rclone remote carla-pack-gdrive (read-only scope), in the browser
@@ -154,8 +154,8 @@ carla-pack credentials tier4/carla-packs   # checks that the drive can be read
 - **CI / unattended runs**: create a service account, add it to the shared drive as Viewer, and set
   `CARLA_PACK_RCLONE_SERVICE_ACCOUNT_FILE` to its JSON key (no rclone remote is needed then). Keep the key in the CI's secrets.
 
-Publishing uploads with rclone (`copyto`), then checks the size and the SHA-256 Google Drive reports against the tarball
-before the entry is appended. It needs write access: a remote of its own, or a service account that is a Content manager
+Publishing uploads with rclone (`copyto`, which compares the uploaded file's hash with the tarball's) before the entry
+is appended; an existing file is not replaced without `--overwrite`. It needs write access: a remote of its own, or a service account that is a Content manager
 of the drive (`CARLA_PACK_RCLONE_SERVICE_ACCOUNT_FILE`):
 
 ```bash

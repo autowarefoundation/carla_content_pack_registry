@@ -8,13 +8,12 @@
 //! connection-string options (`remote,team_drive='…',root_folder_id='…':path`), so the
 //! same files are read whatever that remote's own configuration says. Unattended runs
 //! can use a Google service account the drive is shared with instead of a remote.
+use std::collections::VecDeque;
 use std::ffi::OsString;
-use std::io::{self, Read};
+use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, ExitStatus, Stdio};
 use std::thread::JoinHandle;
-
-use serde::Deserialize;
 
 use crate::error::{Error, Result};
 use crate::manifest::RcloneStorage;
@@ -22,11 +21,10 @@ use crate::manifest::RcloneStorage;
 /// The remote `carla-pack drive login` creates.
 pub const DEFAULT_REMOTE: &str = "carla-pack-gdrive";
 
-/// The oldest rclone that reads Google Drive's SHA-256 checksums.
-pub const MIN_VERSION: &str = "v1.64";
-
 /// How much of rclone's error output goes into a message.
 const STDERR_LINES: usize = 4;
+/// How many of its last lines are kept while a download runs (its retries log too).
+const STDERR_KEPT: usize = 16;
 
 /// How carla-pack runs rclone.
 #[derive(Debug, Clone)]
@@ -47,23 +45,6 @@ impl Default for Rclone {
     fn default() -> Self {
         Self { binary: "rclone".into(), remote: DEFAULT_REMOTE.into(), service_account_file: None, env: Vec::new() }
     }
-}
-
-/// What rclone says about a stored file.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RemoteFile {
-    pub size: u64,
-    /// SHA-256 as the storage reports it (Google Drive does), lower-case hex.
-    pub sha256: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct LsJson {
-    size: i64,
-    is_dir: bool,
-    #[serde(default)]
-    hashes: std::collections::HashMap<String, String>,
 }
 
 /// Whether a call reads or writes (a service account gets the matching OAuth scope).
@@ -183,32 +164,14 @@ impl Rclone {
         Ok(Err(Failure { status: out.status, stderr: String::from_utf8_lossy(&out.stderr).into_owned() }))
     }
 
-    /// The file at `path` (relative to the drive or folder), `None` when there is none.
-    /// On Google Drive a drive that is not shared with the user is an error (404), and a
-    /// missing file in a readable drive is `None`.
-    pub fn stat(&self, storage: &RcloneStorage, path: &str) -> Result<Option<RemoteFile>> {
-        self.stat_as(storage, path, Access::Read)
-    }
-
-    fn stat_as(&self, storage: &RcloneStorage, path: &str, access: Access) -> Result<Option<RemoteFile>> {
+    /// Whether there is a file at `path` (relative to the drive or folder). On Google
+    /// Drive a drive that is not shared with the account is an error (404), and a missing
+    /// file in a readable drive is `false`.
+    fn exists(&self, storage: &RcloneStorage, path: &str, access: Access) -> Result<bool> {
         let spec = self.spec(storage, path, access)?;
-        match self.run(&["lsjson", "--stat", "--hash-type", "sha256", "--", &spec])? {
-            Ok(stdout) => {
-                let item: LsJson = serde_json::from_slice(&stdout).map_err(|e| Error::Storage {
-                    status: 0,
-                    message: format!("unexpected output from `rclone lsjson` for {path}: {e}"),
-                })?;
-                if item.is_dir {
-                    return Err(Error::Storage {
-                        status: 0,
-                        message: format!("{path} in {} is a folder, not a pack", storage.describe()),
-                    });
-                }
-                let sha256 =
-                    item.hashes.get("sha256").map(|h| h.to_ascii_lowercase()).filter(|h| crate::manifest::is_sha256(h));
-                Ok(Some(RemoteFile { size: u64::try_from(item.size).unwrap_or(0), sha256 }))
-            }
-            Err(f) if f.is_not_found() && !f.stderr.contains("Shared drive not found") => Ok(None),
+        match self.run(&["lsjson", "--stat", "--", &spec])? {
+            Ok(_) => Ok(true),
+            Err(f) if f.is_not_found() && !f.stderr.contains("Shared drive not found") => Ok(false),
             Err(f) => Err(self.classify(&f, path, storage)),
         }
     }
@@ -224,7 +187,8 @@ impl Rclone {
         }
     }
 
-    /// Streams the file at `path` from byte `offset` on (`rclone cat --offset`).
+    /// Streams the file at `path` from byte `offset` on (`rclone cat --offset`). A file
+    /// that cannot be read fails on the first read, with the classified error.
     pub fn open(&self, storage: &RcloneStorage, path: &str, offset: u64) -> Result<RcloneReader> {
         let spec = self.spec(storage, path, Access::Read)?;
         let mut cmd = self.command();
@@ -240,27 +204,31 @@ impl Rclone {
             .spawn()
             .map_err(|e| self.spawn_error(e))?;
         let stdout = child.stdout.take().expect("piped stdout");
-        let mut stderr = child.stderr.take().expect("piped stderr");
+        let stderr = BufReader::new(child.stderr.take().expect("piped stderr"));
         let stderr = std::thread::spawn(move || {
-            let mut text = String::new();
-            let _ = stderr.read_to_string(&mut text);
-            text
+            let mut kept = VecDeque::with_capacity(STDERR_KEPT);
+            for line in stderr.lines().map_while(std::result::Result::ok) {
+                if kept.len() == STDERR_KEPT {
+                    kept.pop_front();
+                }
+                kept.push_back(line);
+            }
+            Vec::from(kept).join("\n")
         });
-        Ok(RcloneReader { child: Some(child), stdout, stderr: Some(stderr), path: path.to_string() })
+        Ok(RcloneReader {
+            child: Some(child),
+            stdout,
+            stderr: Some(stderr),
+            rclone: self.clone(),
+            storage: storage.clone(),
+            path: path.to_string(),
+        })
     }
 
-    /// Uploads `local` to `path` (`rclone copyto`), then checks what the storage holds
-    /// against `size` and `sha256`.
-    pub fn upload(
-        &self,
-        storage: &RcloneStorage,
-        local: &Path,
-        path: &str,
-        overwrite: bool,
-        size: u64,
-        sha256: &str,
-    ) -> Result<()> {
-        if !overwrite && self.stat_as(storage, path, Access::Write)?.is_some() {
+    /// Uploads `local` to `path` (`rclone copyto`, which checks the uploaded file's hash
+    /// against the local one itself).
+    pub fn upload(&self, storage: &RcloneStorage, local: &Path, path: &str, overwrite: bool) -> Result<()> {
+        if !overwrite && self.exists(storage, path, Access::Write)? {
             return Err(Error::Usage(format!(
                 "{path} already exists in {}; pass overwrite to replace it",
                 storage.describe()
@@ -269,28 +237,62 @@ impl Rclone {
         let local_text =
             local.to_str().ok_or_else(|| Error::Usage(format!("the tarball path {} is not UTF-8", local.display())))?;
         let spec = self.spec(storage, path, Access::Write)?;
-        if let Err(f) = self.run(&["copyto", "--", local_text, &spec])? {
-            return Err(self.classify(&f, path, storage));
-        }
-        match self.stat_as(storage, path, Access::Write)? {
-            Some(f) if f.size == size && f.sha256.as_deref().is_none_or(|h| h == sha256) => Ok(()),
-            Some(f) => Err(Error::Integrity(format!(
-                "{path} in {} does not match the tarball after the upload (expected {size} bytes, sha256 {sha256}; \
-                 the storage reports {} bytes, sha256 {}); nothing was added to the manifest",
-                storage.describe(),
-                f.size,
-                f.sha256.as_deref().unwrap_or("unknown")
-            ))),
-            None => Err(Error::Storage {
-                status: 0,
-                message: format!("{path} is not in {} after rclone uploaded it", storage.describe()),
-            }),
+        match self.run(&["copyto", "--", local_text, &spec])? {
+            Ok(_) => Ok(()),
+            Err(f) => Err(self.classify(&f, path, storage)),
         }
     }
 
     /// A typed error for a failed rclone call about `path`.
     fn classify(&self, f: &Failure, path: &str, storage: &RcloneStorage) -> Error {
-        classify(f, path, &storage.describe(), &self.identity(), &self.remote, self.service_account_file.is_some())
+        let service_account = self.service_account_file.is_some();
+        let (storage, identity, remote) = (storage.describe(), self.identity(), &self.remote);
+        let lines = f.lines();
+        let err = lines.join("\n");
+        let has = |needles: &[&str]| needles.iter().any(|n| err.contains(n));
+        let detail = Failure::summary_of(&lines, f.status);
+        if !service_account && has(&["didn't find section in config file", "not found in config file"]) {
+            return Error::StorageUnauthenticated(format!(
+                "rclone has no remote {remote:?} for your Google account; run `carla-pack drive login` \
+                 (or set CARLA_PACK_RCLONE_REMOTE to a Google Drive remote you have) [{detail}]"
+            ));
+        }
+        if has(&[
+            "oauth2: ",
+            "invalid_grant",
+            "unauthorized_client",
+            "invalid_client",
+            "Error 401",
+            "empty token",
+            "token expired",
+        ]) {
+            let fix = if service_account {
+                "check the service account key file"
+            } else {
+                "run `carla-pack drive login` again"
+            };
+            return Error::StorageUnauthenticated(format!(
+                "Google rejected the credentials of {identity}; {fix} [{detail}]"
+            ));
+        }
+        if has(&["downloadQuotaExceeded", "rateLimitExceeded", "userRateLimitExceeded", "quotaExceeded", "Error 429"]) {
+            return Error::Storage {
+                status: 429,
+                message: format!(
+                    "Google Drive limited downloads of {path} in {storage} (quota or rate limit); retry later [{detail}]"
+                ),
+            };
+        }
+        if f.is_not_found()
+            || has(&["notFound", "not found", "Error 404", "insufficientFilePermissions", "Error 403", "forbidden"])
+        {
+            return Error::StorageNoAccess(format!(
+                "{path} is not readable in {storage} as {identity}: the file is missing, or the drive or folder is not \
+                 shared with that Google account (Google Drive answers both the same way); ask the drive's owner to \
+                 share it with you, or check `carla-pack drive login` used the right account [{detail}]"
+            ));
+        }
+        Error::Storage { status: 0, message: format!("rclone failed on {path} in {storage}: {detail}") }
     }
 }
 
@@ -317,71 +319,22 @@ impl Failure {
             .collect()
     }
 
-    /// The last lines of rclone's error output.
-    fn summary(&self) -> String {
-        let lines = self.lines();
+    /// The last lines of rclone's error output (`lines`, from [`Failure::lines`]).
+    fn summary_of(lines: &[&str], status: ExitStatus) -> String {
         let tail = &lines[lines.len().saturating_sub(STDERR_LINES)..];
-        if tail.is_empty() { format!("rclone exited with {}", self.status) } else { tail.join(" / ") }
+        if tail.is_empty() { format!("rclone exited with {status}") } else { tail.join(" / ") }
     }
 }
 
-fn classify(f: &Failure, path: &str, storage: &str, identity: &str, remote: &str, service_account: bool) -> Error {
-    let err = f.lines().join("\n");
-    let has = |needles: &[&str]| needles.iter().any(|n| err.contains(n));
-    let detail = f.summary();
-    if has(&["hash type", "unknown flag", "unknown command"]) {
-        return Error::RcloneUnavailable(format!(
-            "this rclone is too old for carla-pack (it needs {MIN_VERSION} or later, for Google Drive's SHA-256); \
-             update it (https://rclone.org/install/) [{detail}]"
-        ));
-    }
-    if !service_account && has(&["didn't find section in config file", "not found in config file"]) {
-        return Error::StorageUnauthenticated(format!(
-            "rclone has no remote {remote:?} for your Google account; run `carla-pack drive login` \
-             (or set CARLA_PACK_RCLONE_REMOTE to a Google Drive remote you have) [{detail}]"
-        ));
-    }
-    if has(&[
-        "oauth2: ",
-        "invalid_grant",
-        "unauthorized_client",
-        "invalid_client",
-        "Error 401",
-        "empty token",
-        "token expired",
-    ]) {
-        let fix =
-            if service_account { "check the service account key file" } else { "run `carla-pack drive login` again" };
-        return Error::StorageUnauthenticated(format!(
-            "Google rejected the credentials of {identity}; {fix} [{detail}]"
-        ));
-    }
-    if has(&["downloadQuotaExceeded", "rateLimitExceeded", "userRateLimitExceeded", "quotaExceeded", "Error 429"]) {
-        return Error::Storage {
-            status: 429,
-            message: format!(
-                "Google Drive limited downloads of {path} in {storage} (quota or rate limit); retry later [{detail}]"
-            ),
-        };
-    }
-    if f.is_not_found()
-        || has(&["notFound", "not found", "Error 404", "insufficientFilePermissions", "Error 403", "forbidden"])
-    {
-        return Error::StorageNoAccess(format!(
-            "{path} is not readable in {storage} as {identity}: the file is missing, or the drive or folder is not \
-             shared with that Google account (Google Drive answers both the same way); ask the drive's owner to share \
-             it with you, or check `carla-pack drive login` used the right account [{detail}]"
-        ));
-    }
-    Error::Storage { status: 0, message: format!("rclone failed on {path} in {storage}: {detail}") }
-}
-
-/// `rclone cat`'s output. At the end the exit status is checked: a failed or cut-off
-/// rclone ends in an I/O error (which the download resumes from), never a silent EOF.
+/// `rclone cat`'s output. At the end the exit status is checked, never a silent EOF: a
+/// cut-off stream is an I/O error (which the download resumes from); a refusal (access,
+/// credentials, quota) carries the typed [`Error`], which ends the download.
 pub struct RcloneReader {
     child: Option<Child>,
     stdout: ChildStdout,
     stderr: Option<JoinHandle<String>>,
+    rclone: Rclone,
+    storage: RcloneStorage,
     path: String,
 }
 
@@ -397,8 +350,10 @@ impl Read for RcloneReader {
         if status.success() {
             return Ok(0);
         }
-        let summary = Failure { status, stderr }.summary();
-        Err(io::Error::other(format!("rclone stopped reading {}: {summary}", self.path)))
+        match self.rclone.classify(&Failure { status, stderr }, &self.path, &self.storage) {
+            Error::Storage { status: 0, message } => Err(io::Error::other(message)),
+            refused => Err(io::Error::other(refused)),
+        }
     }
 }
 
@@ -451,8 +406,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn maps_rclone_errors_to_codes() {
-        let code =
-            |status: i32, stderr: &str| classify(&failure(status, stderr), "p", "drive", "remote r", "r", false).code();
+        let drive = storage(Some("0ABcdEfGhIjKlUk9PVA"), None);
+        let classify = |status: i32, stderr: &str| Rclone::default().classify(&failure(status, stderr), "p", &drive);
+        let code = |status: i32, stderr: &str| classify(status, stderr).code();
         assert_eq!(
             code(1, "CRITICAL: Failed to create file system: didn't find section in config file (\"r\")"),
             "storage_unauthenticated"
@@ -468,14 +424,7 @@ mod tests {
         assert_eq!(code(1, "googleapi: Error 404: Shared drive not found: 0AB, notFound"), "storage_no_access");
         assert_eq!(code(3, "Failed to lsjson: directory not found"), "storage_no_access");
         assert_eq!(code(1, "something else"), "storage_error");
-        let msg = classify(
-            &failure(1, "NOTICE: Config file \"x\" not found - using defaults\nERROR : boom"),
-            "p",
-            "d",
-            "i",
-            "r",
-            false,
-        );
-        assert!(msg.to_string().ends_with("rclone failed on p in d: ERROR : boom"), "{msg}");
+        let msg = classify(1, "NOTICE: Config file \"x\" not found - using defaults\nERROR : boom");
+        assert!(msg.to_string().ends_with("shared drive 0ABcdEfGhIjKlUk9PVA: ERROR : boom"), "{msg}");
     }
 }

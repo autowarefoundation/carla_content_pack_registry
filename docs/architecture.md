@@ -33,10 +33,10 @@ With Google Drive storage (`type = "rclone"`), steps 3 and 4 are replaced by rcl
 user's own Google credentials (their rclone remote, or a service account in CI); nothing is vended through GitHub:
 
 ```
-3'. rclone lsjson --stat --hash-type sha256 -- '<remote>,team_drive=…,root_folder_id=…,shared_with_me=false:<prefix><key>'
-    ← size and Drive's SHA-256: refused before downloading if either differs from the manifest; a drive not shared
-      with the account → storage_no_access, no remote / a rejected token → storage_unauthenticated
-4'. rclone cat [--offset N] -- '<same>'   ← tarball on stdout (saved while streaming SHA-256; resumed with --offset)
+3'. rclone cat [--offset N] -- '<remote>,team_drive=…,root_folder_id=…,shared_with_me=false:<prefix><key>'
+    ← tarball on stdout (saved while streaming SHA-256; a cut-off stream is resumed with --offset)
+    ✗ a refusal ends the download at once, classified from rclone's output: a missing file or a drive not shared
+      with the account → storage_no_access, no remote / a rejected token → storage_unauthenticated, quota → storage_error
 ```
 
 The drive and folder are always set from the manifest (empty when absent), so a remote configured for another drive cannot redirect the read.
@@ -146,7 +146,7 @@ A key with less than 2 minutes left is not used; the error says the key workflow
 | `src/manifest.rs` | Types and validation of `carla-packs.toml`, the reference `OWNER/REPO/PACK[@VER]`, release selection |
 | `src/sigv4.rs` | AWS Signature V4 (header signing, `UNSIGNED-PAYLOAD`). Verified with AWS's official test vectors |
 | `src/hf.rs` | Fetching from public Hugging Face repositories (anonymous `resolve` URLs, resumed with Range) |
-| `src/rclone.rs` | Google Drive through rclone: the pinned remote spec, `lsjson` (access, size, SHA-256), `cat --offset` (streamed, resumed), `copyto` + check (publish), rclone errors → codes |
+| `src/rclone.rs` | Google Drive through rclone: the pinned remote spec, `cat --offset` (streamed, resumed), `lsjson` (access check, existence before publishing), `copyto` (publish), rclone errors → codes |
 | `src/s3.rs` | GET (resumed with Range) / HEAD / PUT; multipart upload above 64 MiB (aborted on failure). Path / virtual-host addressing |
 | `src/client.rs` | `resolve` / `find_map` / `fetch` (cache and verification) / `install` / `unpack` / `formats` / `map_data` / `publish` |
 | `src/pack.rs` | Safe tarball extraction, checking every file against `carla-pack.json`, installation |

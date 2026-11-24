@@ -67,12 +67,16 @@ impl World {
     }
 
     fn client(&self, remote: &str) -> Client {
+        self.client_with(self.rclone(remote))
+    }
+
+    fn client_with(&self, rclone: Rclone) -> Client {
         Client::with_options(ClientOptions {
             token: Some(Token { value: TOKEN.into(), source: "test" }),
             repos: vec![REPO.into()],
             github_api: self.github.base_url(),
             cache_dir: self.dir.path().join("cache"),
-            rclone: self.rclone(remote),
+            rclone,
         })
         .unwrap()
     }
@@ -114,7 +118,7 @@ fn packs_come_from_the_drive_through_rclone() {
 
     let status = c.credentials_status(REPO).unwrap();
     assert_eq!(status.storage, format!("Google Drive shared drive {DRIVE}"));
-    assert_eq!(status.rclone.as_deref(), Some("rclone remote gdrive"));
+    assert_eq!(status.read_as.as_deref(), Some("rclone remote gdrive"));
     assert_eq!(json!(status.mode), json!("rclone"));
 }
 
@@ -128,10 +132,13 @@ fn access_problems_have_their_own_codes() {
         c.fetch(&release).unwrap_err()
     };
 
-    // Not on the drive (or not shared with the account: Google Drive answers alike).
+    // Not on the drive (or not shared with the account: Google Drive answers alike). A
+    // refusal is not resumed: it fails at once, before the first resume's delay.
+    let started = std::time::Instant::now();
     let e = fetch(w.client("gdrive"));
     assert_eq!(e.code(), "storage_no_access", "{e}");
     assert!(e.to_string().contains("rclone remote gdrive"), "{e}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(2), "{:?}", started.elapsed());
 
     // No such remote: `carla-pack drive login` has not been run.
     let e = fetch(w.client("carla-pack-gdrive"));
@@ -139,33 +146,21 @@ fn access_problems_have_their_own_codes() {
     assert!(e.to_string().contains("carla-pack drive login"), "{e}");
 
     // No rclone at all.
-    let mut c = w.client("gdrive");
-    let mut r = w.rclone("gdrive");
-    r.binary = w.dir.path().join("no-rclone-here");
-    c = Client::with_options(ClientOptions {
-        token: Some(Token { value: TOKEN.into(), source: "test" }),
-        repos: c.repos().to_vec(),
-        github_api: w.github.base_url(),
-        cache_dir: c.cache_dir().to_path_buf(),
-        rclone: r,
-    })
-    .unwrap();
-    let e = fetch(c);
+    let e = fetch(w.client_with(Rclone { binary: w.dir.path().join("no-rclone-here"), ..w.rclone("gdrive") }));
     assert_eq!(e.code(), "rclone_unavailable", "{e}");
 
-    // A file that differs from the manifest is refused before it is downloaded (size), and
-    // one of the right size by the SHA-256 the storage reports.
+    // A file that differs from the manifest is discarded, like from any storage.
     let mut other = body.clone();
     *other.last_mut().unwrap() ^= 1;
     fs::write(w.drive().join("packs").join(KEY), &other).unwrap();
     let e = fetch(w.client("gdrive"));
     assert!(matches!(e, Error::Integrity(_)), "{e}");
-    assert!(e.to_string().contains("nothing was downloaded"), "{e}");
+    assert!(e.to_string().contains("nothing was installed"), "{e}");
     assert!(!w.dir.path().join("cache").join("blobs").read_dir().is_ok_and(|mut d| d.next().is_some()));
 }
 
 #[test]
-fn publish_uploads_through_rclone_and_checks_what_arrived() {
+fn publish_uploads_through_rclone() {
     let Some(w) = World::new() else { return };
     let manifest = w.dir.path().join("carla-packs.toml");
     fs::write(&manifest, World::storage_text()).unwrap();
@@ -216,16 +211,7 @@ fn a_broken_download_resumes_from_where_it_stopped() {
     )
     .unwrap();
     fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
-    let mut rclone = w.rclone("gdrive");
-    rclone.binary = wrapper;
-    let c = Client::with_options(ClientOptions {
-        token: Some(Token { value: TOKEN.into(), source: "test" }),
-        repos: vec![REPO.into()],
-        github_api: w.github.base_url(),
-        cache_dir: w.dir.path().join("cache"),
-        rclone,
-    })
-    .unwrap();
+    let c = w.client_with(Rclone { binary: wrapper, ..w.rclone("gdrive") });
 
     let release = c.find_map("MiniTown", None, &Filter::default()).unwrap();
     assert_eq!(fs::read(c.fetch(&release).unwrap()).unwrap(), body);

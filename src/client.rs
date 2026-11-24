@@ -15,8 +15,8 @@ use sha2::{Digest, Sha256};
 use crate::error::{Error, Result};
 use crate::github::{GitHub, Vended};
 use crate::manifest::{
-    CredentialMode, Filter, HfStorage, Manifest, PackEntry, PackRef, RcloneStorage, Storage, StorageConfig, is_sha256,
-    select, validate_repo,
+    AccessMode, CredentialMode, Filter, HfStorage, Manifest, PackEntry, PackRef, RcloneStorage, Storage, StorageConfig,
+    is_sha256, select, validate_repo,
 };
 use crate::pack::{self, Expected, InstallOptions, InstalledPack};
 use crate::rclone::Rclone;
@@ -66,12 +66,12 @@ pub struct CredentialStatus {
     pub repo: String,
     /// "bucket NAME" or "Hugging Face dataset OWNER/NAME".
     pub storage: String,
-    pub mode: CredentialMode,
+    pub mode: AccessMode,
     pub access_key_id: Option<String>,
     pub expires_at: Option<String>,
-    /// For rclone storage: what reads it (the rclone remote, or a service account),
-    /// checked to be able to read it.
-    pub rclone: Option<String>,
+    /// Who reads the storage, when that is the user's own identity (rclone: the remote
+    /// or service account), checked to be able to read it.
+    pub read_as: Option<String>,
 }
 
 pub struct Client {
@@ -258,11 +258,11 @@ impl Client {
             mode,
             access_key_id: None,
             expires_at: None,
-            rclone: None,
+            read_as: None,
         };
         if let Storage::Rclone(storage) = &m.storage {
             self.rclone.check_access(storage)?;
-            status.rclone = Some(self.rclone.identity());
+            status.read_as = Some(self.rclone.identity());
         }
         if let Storage::S3(StorageConfig { credentials: CredentialMode::GithubRelease, credentials_tag, .. }) =
             &m.storage
@@ -290,7 +290,6 @@ impl Client {
         let creds = self.storage_credentials(&release.repo, &manifest)?;
         let source = Source::new(&manifest.storage, creds.as_ref(), &self.rclone);
         let object_key = manifest.storage.object_key(&release.pack.key);
-        source.preflight(&object_key, release)?;
         let mut res = source.get(&self.http, &object_key)?;
 
         let dir = dest.parent().expect("blob path has a parent");
@@ -317,6 +316,10 @@ impl Client {
                         continue;
                     }
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    // A source's typed error (access refused, quota) does not go away by resuming.
+                    Err(e) if e.get_ref().is_some_and(|inner| inner.is::<Error>()) => {
+                        return Err(*e.into_inner().and_then(|inner| inner.downcast().ok()).expect("checked above"));
+                    }
                     Err(e) => e.to_string(),
                 };
                 // The connection ended early: carry on from where it stopped. The hash covers
@@ -409,33 +412,6 @@ impl<'a> Source<'a> {
             Storage::HuggingFace(hf) => Self::HuggingFace(hf),
             Storage::Rclone(config) => Self::Rclone(config, rclone),
         }
-    }
-
-    /// Checks before downloading what can be checked without the bytes. rclone: that the
-    /// file is readable (a typed access error rather than a broken stream), and that the
-    /// size and SHA-256 Google Drive reports match the manifest.
-    fn preflight(&self, path: &str, release: &Release) -> Result<()> {
-        let Self::Rclone(storage, rclone) = self else { return Ok(()) };
-        let Some(found) = rclone.stat(storage, path)? else {
-            return Err(Error::StorageNoAccess(format!(
-                "{path} is not in {} as {} (the file is missing, or not shared with that account)",
-                storage.describe(),
-                rclone.identity()
-            )));
-        };
-        if found.size != release.pack.size || found.sha256.as_deref().is_some_and(|h| h != release.pack.sha256) {
-            return Err(Error::Integrity(format!(
-                "{path} in {} does not match its manifest entry in {} (expected {} bytes, sha256 {}; the storage \
-                 reports {} bytes, sha256 {}); nothing was downloaded",
-                storage.describe(),
-                release.repo,
-                release.pack.size,
-                release.pack.sha256,
-                found.size,
-                found.sha256.as_deref().unwrap_or("unknown")
-            )));
-        }
-        Ok(())
     }
 
     fn get(&self, http: &Http, path: &str) -> Result<Body> {
@@ -558,6 +534,32 @@ pub fn append_entry(manifest_path: &Path, entry: &PackEntry) -> Result<()> {
     Ok(())
 }
 
+/// Uploads `tarball` to the S3 bucket with write credentials (multipart above one part).
+fn upload_to_bucket(
+    storage: &StorageConfig,
+    plan: &PublishPlan,
+    tarball: &Path,
+    opts: &PublishOptions,
+    upload_credentials: Option<&Credentials>,
+) -> Result<()> {
+    let creds = upload_credentials.ok_or_else(|| {
+        Error::Usage(
+            "uploading needs write credentials for the bucket: set CARLA_PACK_UPLOAD_ACCESS_KEY_ID and \
+             CARLA_PACK_UPLOAD_SECRET_ACCESS_KEY (or AWS_*), or upload yourself and pass --no-upload"
+                .into(),
+        )
+    })?;
+    let http = http_client()?;
+    let bucket = Bucket { config: storage, credentials: Some(creds) };
+    if !opts.overwrite && bucket.head(&http, &plan.object_key)?.is_some() {
+        return Err(Error::Usage(format!(
+            "{} already exists in bucket {}; pass overwrite to replace it",
+            plan.object_key, storage.bucket
+        )));
+    }
+    bucket.put_file(&http, &plan.object_key, tarball, opts.part_size.unwrap_or(crate::s3::DEFAULT_PART_SIZE))
+}
+
 /// Adds the pack `tarball` to the manifest file at `manifest_path` (a checkout of the pack
 /// repository) and, with `opts.upload`, uploads it to the S3 bucket with `upload_credentials`
 /// (write access, from the environment). The manifest entry is appended, so comments survive;
@@ -572,14 +574,12 @@ pub fn publish(
 ) -> Result<PackEntry> {
     let plan = plan_publish(manifest_path, tarball, opts)?;
     if opts.upload {
-        let storage = match &plan.storage {
-            Storage::S3(s) => s,
-            Storage::Rclone(r) => {
-                let rclone = opts.rclone.clone().unwrap_or_else(Rclone::from_env);
-                rclone.upload(r, tarball, &plan.object_key, opts.overwrite, plan.entry.size, &plan.entry.sha256)?;
-                append_entry(manifest_path, &plan.entry)?;
-                return Ok(plan.entry);
-            }
+        match &plan.storage {
+            Storage::S3(storage) => upload_to_bucket(storage, &plan, tarball, opts, upload_credentials)?,
+            Storage::Rclone(storage) => match &opts.rclone {
+                Some(rclone) => rclone.upload(storage, tarball, &plan.object_key, opts.overwrite)?,
+                None => Rclone::from_env().upload(storage, tarball, &plan.object_key, opts.overwrite)?,
+            },
             Storage::HuggingFace(hf) => {
                 return Err(Error::Usage(format!(
                     "uploading to Hugging Face goes through the Python package (`carla-pack publish`, or \
@@ -591,23 +591,7 @@ pub fn publish(
                     hf.repo_type.as_str()
                 )));
             }
-        };
-        let creds = upload_credentials.ok_or_else(|| {
-            Error::Usage(
-                "uploading needs write credentials for the bucket: set CARLA_PACK_UPLOAD_ACCESS_KEY_ID and \
-                 CARLA_PACK_UPLOAD_SECRET_ACCESS_KEY (or AWS_*), or upload yourself and pass --no-upload"
-                    .into(),
-            )
-        })?;
-        let http = http_client()?;
-        let bucket = Bucket { config: storage, credentials: Some(creds) };
-        if !opts.overwrite && bucket.head(&http, &plan.object_key)?.is_some() {
-            return Err(Error::Usage(format!(
-                "{} already exists in bucket {}; pass overwrite to replace it",
-                plan.object_key, storage.bucket
-            )));
         }
-        bucket.put_file(&http, &plan.object_key, tarball, opts.part_size.unwrap_or(crate::s3::DEFAULT_PART_SIZE))?;
     }
     append_entry(manifest_path, &plan.entry)?;
     Ok(plan.entry)

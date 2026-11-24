@@ -70,8 +70,28 @@ pub enum CredentialMode {
     GithubRelease,
     /// A public bucket: unsigned requests.
     Anonymous,
+}
+
+/// How a storage's downloads are authorised, whatever its type (what `carla-pack
+/// credentials` reports).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AccessMode {
+    /// Read-only credentials vended through the pack repository's release.
+    GithubRelease,
+    /// No credentials: a public bucket or Hugging Face repository.
+    Anonymous,
     /// Each user's own rclone remote (their Google account): the storage's sharing decides.
     Rclone,
+}
+
+impl From<CredentialMode> for AccessMode {
+    fn from(mode: CredentialMode) -> Self {
+        match mode {
+            CredentialMode::GithubRelease => Self::GithubRelease,
+            CredentialMode::Anonymous => Self::Anonymous,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
@@ -150,11 +170,11 @@ impl Storage {
     }
 
     /// How downloads are authorised: vended credentials, or none.
-    pub fn credential_mode(&self) -> CredentialMode {
+    pub fn credential_mode(&self) -> AccessMode {
         match self {
-            Self::S3(c) => c.credentials,
-            Self::HuggingFace(_) => CredentialMode::Anonymous,
-            Self::Rclone(_) => CredentialMode::Rclone,
+            Self::S3(c) => c.credentials.into(),
+            Self::HuggingFace(_) => AccessMode::Anonymous,
+            Self::Rclone(_) => AccessMode::Rclone,
         }
     }
 
@@ -400,9 +420,6 @@ impl StorageConfig {
             return Err(format!("storage.region {:?} is not a valid region", self.region));
         }
         validate_prefix(&self.prefix)?;
-        if self.credentials == CredentialMode::Rclone {
-            return Err("storage.credentials = \"rclone\" needs type = \"rclone\"".into());
-        }
         if self.credentials_tag.is_empty() || self.credentials_tag.contains(['/', ' ']) {
             return Err(format!("storage.credentials_tag {:?} is not a valid tag", self.credentials_tag));
         }
@@ -625,7 +642,7 @@ mod tests {
             (s.repo_type, s.revision.as_str(), s.endpoint.as_str()),
             (HfRepoType::Dataset, "main", "https://huggingface.co")
         );
-        assert_eq!(m.storage.credential_mode(), CredentialMode::Anonymous);
+        assert_eq!(m.storage.credential_mode(), AccessMode::Anonymous);
         assert_eq!(m.storage.describe(), "Hugging Face dataset AutowareFoundation/carla-packs");
 
         // The manifest survives a round trip (publish re-serialises it to validate a new entry).
@@ -657,7 +674,7 @@ mod tests {
             (s.backend, s.team_drive.as_deref(), s.root_folder_id.as_deref()),
             (RcloneBackend::Drive, Some("0ABcdEfGhIjKlUk9PVA"), None)
         );
-        assert_eq!(m.storage.credential_mode(), CredentialMode::Rclone);
+        assert_eq!(m.storage.credential_mode(), AccessMode::Rclone);
         assert_eq!(m.storage.describe(), "Google Drive shared drive 0ABcdEfGhIjKlUk9PVA");
         assert_eq!(m.storage.object_key("a.tar.gz"), "packs/a.tar.gz");
         let again = Manifest::parse(&toml::to_string(&m).unwrap(), "t").unwrap();
