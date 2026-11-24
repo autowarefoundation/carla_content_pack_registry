@@ -8,6 +8,7 @@ import argparse
 import json
 import os
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Callable
@@ -120,6 +121,45 @@ def cmd_whoami(args: argparse.Namespace) -> int:
     user = client.whoami()
     data = {"login": user["login"], "id": user["id"], "token_source": client.token_source, "repos": client.repos}
     _out(args, data, lambda: print(f"{user['login']} (GitHub id {user['id']}, token from {client.token_source})"))
+    return 0
+
+
+# --------------------------------------------------------------------------- Google Drive (rclone)
+
+
+def cmd_drive_login(args: argparse.Namespace) -> int:
+    binary, default_remote, service_account = _core.rclone_settings()
+    remote = args.remote.rstrip(":") if args.remote else default_remote
+    if service_account and not args.remote:
+        print(f"note: CARLA_PACK_RCLONE_SERVICE_ACCOUNT_FILE is set, so carla-pack reads Drive as {service_account}, "
+              "not through this remote", file=sys.stderr)
+    scope = "drive" if args.write else "drive.readonly"
+    options = [f"scope={scope}"]
+    client_id = args.client_id or os.environ.get("CARLA_PACK_DRIVE_CLIENT_ID")
+    client_secret = args.client_secret or os.environ.get("CARLA_PACK_DRIVE_CLIENT_SECRET")
+    if client_id:
+        options.append(f"client_id={client_id}")
+    if client_secret:
+        options.append(f"client_secret={client_secret}")
+    if args.token_stdin:
+        token = sys.stdin.read().strip()
+        if not token.startswith("{"):
+            raise CliError("expected the token JSON `rclone authorize drive` printed, on standard input")
+        options.append(f"token={token}")
+    elif args.headless:
+        options.append("config_is_local=false")
+    # rclone asks in the browser (or, headless, for the `rclone authorize` output) itself.
+    try:
+        done = subprocess.run([binary, "config", "create", remote, "drive", *options], check=False)
+    except FileNotFoundError:
+        raise CliError(
+            f"rclone was not found ({binary}): install it (https://rclone.org/install/) or set CARLA_PACK_RCLONE"
+        ) from None
+    if done.returncode != 0:
+        raise CliError(f"`rclone config create {remote} drive` failed (exit {done.returncode})")
+    print(f"rclone remote {remote} is set up for Google Drive (scope {scope}).")
+    if remote != default_remote:
+        print(f"carla-pack reads through {default_remote}: set CARLA_PACK_RCLONE_REMOTE={remote} to use this one.")
     return 0
 
 
@@ -297,6 +337,8 @@ def cmd_credentials(args: argparse.Namespace) -> int:
 
     def human() -> None:
         print(f"{s['repo']}: {s['storage']} ({s['mode']})")
+        if s.get("read_as"):
+            print(f"  read as    : {s['read_as']} (it can read the storage)")
         if s.get("access_key_id"):
             print(f"  access key : {s['access_key_id']}")
             print(f"  expires at : {s.get('expires_at') or 'never (long-lived key)'}")
@@ -373,6 +415,19 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--scope", default="", help='OAuth App scope (GitHub Apps ignore it; an OAuth App needs "repo")')
     add("logout", "forget the saved token", cmd_logout)
     add("whoami", "show the GitHub user and where the token comes from", cmd_whoami)
+
+    drive = add("drive", "Google Drive storage, read through rclone", lambda a: (drive.print_help(), 0)[1])
+    dsub = drive.add_subparsers(dest="drive_command")
+    s = add("login", "set up the rclone remote carla-pack reads Google Drive with (your Google account)",
+            cmd_drive_login, dsub)
+    s.add_argument("--remote", help="the rclone remote to create (default CARLA_PACK_RCLONE_REMOTE or carla-pack-gdrive)")
+    s.add_argument("--write", action="store_true", help="full Drive access, to publish packs (default: read-only)")
+    s.add_argument("--client-id", help="your Workspace's OAuth client ID (default CARLA_PACK_DRIVE_CLIENT_ID)")
+    s.add_argument("--client-secret", help="its client secret (default CARLA_PACK_DRIVE_CLIENT_SECRET)")
+    s.add_argument("--headless", action="store_true",
+                   help="no browser here: rclone asks for the output of `rclone authorize drive` run elsewhere")
+    s.add_argument("--token-stdin", action="store_true",
+                   help="read the token JSON `rclone authorize drive` printed on another machine from stdin")
 
     repo = add("repo", "pack repositories searched by map name", lambda a: (repo.print_help(), 0)[1])
     rsub = repo.add_subparsers(dest="repo_command")

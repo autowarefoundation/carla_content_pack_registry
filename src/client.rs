@@ -1,5 +1,6 @@
 //! The client: find a pack in a GitHub repository the user can read, download it from the
-//! repository's S3-compatible bucket, verify it and install it.
+//! repository's storage (an S3-compatible bucket, a public Hugging Face repository, or a
+//! Google Drive read through rclone), verify it and install it.
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, BufWriter, Read, Write};
@@ -14,10 +15,11 @@ use sha2::{Digest, Sha256};
 use crate::error::{Error, Result};
 use crate::github::{GitHub, Vended};
 use crate::manifest::{
-    CredentialMode, Filter, HfStorage, Manifest, PackEntry, PackRef, Storage, StorageConfig, is_sha256, select,
-    validate_repo,
+    AccessMode, CredentialMode, Filter, HfStorage, Manifest, PackEntry, PackRef, RcloneStorage, Storage, StorageConfig,
+    is_sha256, select, validate_repo,
 };
 use crate::pack::{self, Expected, InstallOptions, InstalledPack};
+use crate::rclone::Rclone;
 use crate::s3::Bucket;
 use crate::sigv4::{Credentials, hex};
 use crate::store::{self, Store, Token};
@@ -64,9 +66,12 @@ pub struct CredentialStatus {
     pub repo: String,
     /// "bucket NAME" or "Hugging Face dataset OWNER/NAME".
     pub storage: String,
-    pub mode: CredentialMode,
+    pub mode: AccessMode,
     pub access_key_id: Option<String>,
     pub expires_at: Option<String>,
+    /// Who reads the storage, when that is the user's own identity (rclone: the remote
+    /// or service account), checked to be able to read it.
+    pub read_as: Option<String>,
 }
 
 pub struct Client {
@@ -77,6 +82,7 @@ pub struct Client {
     repos: Vec<String>,
     manifests: Mutex<HashMap<String, Manifest>>,
     credentials: Mutex<HashMap<String, Vended>>,
+    rclone: Rclone,
 }
 
 /// Everything a [`Client`] reads from the environment, for embedding and tests.
@@ -86,6 +92,8 @@ pub struct ClientOptions {
     pub repos: Vec<String>,
     pub github_api: String,
     pub cache_dir: PathBuf,
+    /// How rclone storage is read ([`Rclone::from_env`] by default).
+    pub rclone: Rclone,
 }
 
 impl Client {
@@ -102,6 +110,7 @@ impl Client {
             repos: repos.unwrap_or_else(|| saved.search_repos()),
             github_api: GitHub::default_api(),
             cache_dir: store::cache_dir()?,
+            rclone: Rclone::from_env(),
         })
     }
 
@@ -118,6 +127,7 @@ impl Client {
             repos: opts.repos,
             manifests: Mutex::default(),
             credentials: Mutex::default(),
+            rclone: opts.rclone,
         })
     }
 
@@ -248,7 +258,12 @@ impl Client {
             mode,
             access_key_id: None,
             expires_at: None,
+            read_as: None,
         };
+        if let Storage::Rclone(storage) = &m.storage {
+            self.rclone.check_access(storage)?;
+            status.read_as = Some(self.rclone.identity());
+        }
         if let Storage::S3(StorageConfig { credentials: CredentialMode::GithubRelease, credentials_tag, .. }) =
             &m.storage
         {
@@ -273,7 +288,7 @@ impl Client {
         }
         let manifest = self.manifest(&release.repo)?;
         let creds = self.storage_credentials(&release.repo, &manifest)?;
-        let source = Source::new(&manifest.storage, creds.as_ref());
+        let source = Source::new(&manifest.storage, creds.as_ref(), &self.rclone);
         let object_key = manifest.storage.object_key(&release.pack.key);
         let mut res = source.get(&self.http, &object_key)?;
 
@@ -301,6 +316,10 @@ impl Client {
                         continue;
                     }
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    // A source's typed error (access refused, quota) does not go away by resuming.
+                    Err(e) if e.get_ref().is_some_and(|inner| inner.is::<Error>()) => {
+                        return Err(*e.into_inner().and_then(|inner| inner.downcast().ok()).expect("checked above"));
+                    }
                     Err(e) => e.to_string(),
                 };
                 // The connection ended early: carry on from where it stopped. The hash covers
@@ -376,32 +395,39 @@ impl Client {
     }
 }
 
-/// Where a download comes from: a (signed) S3 bucket or a public Hugging Face repository.
+/// Where a download comes from: a (signed) S3 bucket, a public Hugging Face repository,
+/// or a Google Drive read through rclone.
 enum Source<'a> {
     S3(Bucket<'a>),
     HuggingFace(&'a HfStorage),
+    Rclone(&'a RcloneStorage, &'a Rclone),
 }
 
+type Body = Box<dyn Read + Send>;
+
 impl<'a> Source<'a> {
-    fn new(storage: &'a Storage, credentials: Option<&'a Credentials>) -> Self {
+    fn new(storage: &'a Storage, credentials: Option<&'a Credentials>, rclone: &'a Rclone) -> Self {
         match storage {
             Storage::S3(config) => Self::S3(Bucket { config, credentials }),
             Storage::HuggingFace(hf) => Self::HuggingFace(hf),
+            Storage::Rclone(config) => Self::Rclone(config, rclone),
         }
     }
 
-    fn get(&self, http: &Http, path: &str) -> Result<reqwest::blocking::Response> {
-        match self {
-            Self::S3(b) => b.get(http, path),
-            Self::HuggingFace(hf) => crate::hf::get(http, hf, path),
-        }
+    fn get(&self, http: &Http, path: &str) -> Result<Body> {
+        Ok(match self {
+            Self::S3(b) => Box::new(b.get(http, path)?),
+            Self::HuggingFace(hf) => Box::new(crate::hf::get(http, hf, path)?),
+            Self::Rclone(storage, rclone) => Box::new(rclone.open(storage, path, 0)?),
+        })
     }
 
-    fn get_from(&self, http: &Http, path: &str, offset: u64) -> Result<Option<reqwest::blocking::Response>> {
-        match self {
-            Self::S3(b) => b.get_from(http, path, offset),
-            Self::HuggingFace(hf) => crate::hf::get_from(http, hf, path, offset),
-        }
+    fn get_from(&self, http: &Http, path: &str, offset: u64) -> Result<Option<Body>> {
+        Ok(match self {
+            Self::S3(b) => b.get_from(http, path, offset)?.map(|r| Box::new(r) as Body),
+            Self::HuggingFace(hf) => crate::hf::get_from(http, hf, path, offset)?.map(|r| Box::new(r) as Body),
+            Self::Rclone(storage, rclone) => Some(Box::new(rclone.open(storage, path, offset)?)),
+        })
     }
 }
 
@@ -417,6 +443,8 @@ pub struct PublishOptions {
     pub description: Option<String>,
     /// Multipart part size in bytes (default 64 MiB); files up to one part go up in one PUT.
     pub part_size: Option<u64>,
+    /// How rclone storage is written ([`Rclone::from_env`] by default).
+    pub rclone: Option<Rclone>,
 }
 
 /// A checked publication: the manifest entry for a tarball, and where it goes.
@@ -506,6 +534,32 @@ pub fn append_entry(manifest_path: &Path, entry: &PackEntry) -> Result<()> {
     Ok(())
 }
 
+/// Uploads `tarball` to the S3 bucket with write credentials (multipart above one part).
+fn upload_to_bucket(
+    storage: &StorageConfig,
+    plan: &PublishPlan,
+    tarball: &Path,
+    opts: &PublishOptions,
+    upload_credentials: Option<&Credentials>,
+) -> Result<()> {
+    let creds = upload_credentials.ok_or_else(|| {
+        Error::Usage(
+            "uploading needs write credentials for the bucket: set CARLA_PACK_UPLOAD_ACCESS_KEY_ID and \
+             CARLA_PACK_UPLOAD_SECRET_ACCESS_KEY (or AWS_*), or upload yourself and pass --no-upload"
+                .into(),
+        )
+    })?;
+    let http = http_client()?;
+    let bucket = Bucket { config: storage, credentials: Some(creds) };
+    if !opts.overwrite && bucket.head(&http, &plan.object_key)?.is_some() {
+        return Err(Error::Usage(format!(
+            "{} already exists in bucket {}; pass overwrite to replace it",
+            plan.object_key, storage.bucket
+        )));
+    }
+    bucket.put_file(&http, &plan.object_key, tarball, opts.part_size.unwrap_or(crate::s3::DEFAULT_PART_SIZE))
+}
+
 /// Adds the pack `tarball` to the manifest file at `manifest_path` (a checkout of the pack
 /// repository) and, with `opts.upload`, uploads it to the S3 bucket with `upload_credentials`
 /// (write access, from the environment). The manifest entry is appended, so comments survive;
@@ -520,8 +574,12 @@ pub fn publish(
 ) -> Result<PackEntry> {
     let plan = plan_publish(manifest_path, tarball, opts)?;
     if opts.upload {
-        let storage = match &plan.storage {
-            Storage::S3(s) => s,
+        match &plan.storage {
+            Storage::S3(storage) => upload_to_bucket(storage, &plan, tarball, opts, upload_credentials)?,
+            Storage::Rclone(storage) => match &opts.rclone {
+                Some(rclone) => rclone.upload(storage, tarball, &plan.object_key, opts.overwrite)?,
+                None => Rclone::from_env().upload(storage, tarball, &plan.object_key, opts.overwrite)?,
+            },
             Storage::HuggingFace(hf) => {
                 return Err(Error::Usage(format!(
                     "uploading to Hugging Face goes through the Python package (`carla-pack publish`, or \
@@ -533,23 +591,7 @@ pub fn publish(
                     hf.repo_type.as_str()
                 )));
             }
-        };
-        let creds = upload_credentials.ok_or_else(|| {
-            Error::Usage(
-                "uploading needs write credentials for the bucket: set CARLA_PACK_UPLOAD_ACCESS_KEY_ID and \
-                 CARLA_PACK_UPLOAD_SECRET_ACCESS_KEY (or AWS_*), or upload yourself and pass --no-upload"
-                    .into(),
-            )
-        })?;
-        let http = http_client()?;
-        let bucket = Bucket { config: storage, credentials: Some(creds) };
-        if !opts.overwrite && bucket.head(&http, &plan.object_key)?.is_some() {
-            return Err(Error::Usage(format!(
-                "{} already exists in bucket {}; pass overwrite to replace it",
-                plan.object_key, storage.bucket
-            )));
         }
-        bucket.put_file(&http, &plan.object_key, tarball, opts.part_size.unwrap_or(crate::s3::DEFAULT_PART_SIZE))?;
     }
     append_entry(manifest_path, &plan.entry)?;
     Ok(plan.entry)

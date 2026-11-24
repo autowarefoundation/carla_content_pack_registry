@@ -20,6 +20,15 @@
 //! # revision = "main"               # default; a branch, tag or commit
 //! # prefix = "packs/"
 //!
+//! # or, for packs on a Google Drive shared drive, read through rclone with each user's
+//! # own Google account (who may read them is the drive's sharing):
+//! # [storage]
+//! # type = "rclone"
+//! # backend = "drive"
+//! # team_drive = "0ABcdEfGhIjKlUk9PVA"  # the shared drive's ID
+//! # root_folder_id = "1a2b3c…"        # optional: a folder in it (or a shared folder)
+//! # prefix = "packs/"
+//!
 //! [[pack]]
 //! name = "Town01Pack"
 //! version = "1.0.0"
@@ -63,6 +72,28 @@ pub enum CredentialMode {
     Anonymous,
 }
 
+/// How a storage's downloads are authorised, whatever its type (what `carla-pack
+/// credentials` reports).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AccessMode {
+    /// Read-only credentials vended through the pack repository's release.
+    GithubRelease,
+    /// No credentials: a public bucket or Hugging Face repository.
+    Anonymous,
+    /// Each user's own rclone remote (their Google account): the storage's sharing decides.
+    Rclone,
+}
+
+impl From<CredentialMode> for AccessMode {
+    fn from(mode: CredentialMode) -> Self {
+        match mode {
+            CredentialMode::GithubRelease => Self::GithubRelease,
+            CredentialMode::Anonymous => Self::Anonymous,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum Addressing {
@@ -80,6 +111,8 @@ pub enum Storage {
     S3(StorageConfig),
     /// A public repository on the Hugging Face Hub (read anonymously).
     HuggingFace(HfStorage),
+    /// A Google Drive shared drive (or folder), read through rclone as the user.
+    Rclone(RcloneStorage),
 }
 
 /// `[storage]` with its `type` tag; a table without one is `s3`.
@@ -88,6 +121,7 @@ pub enum Storage {
 enum TaggedStorage {
     S3(StorageConfig),
     Huggingface(HfStorage),
+    Rclone(RcloneStorage),
 }
 
 impl<'de> Deserialize<'de> for Storage {
@@ -98,6 +132,7 @@ impl<'de> Deserialize<'de> for Storage {
         Ok(match tagged {
             TaggedStorage::S3(c) => Self::S3(c),
             TaggedStorage::Huggingface(c) => Self::HuggingFace(c),
+            TaggedStorage::Rclone(c) => Self::Rclone(c),
         })
     }
 }
@@ -107,6 +142,7 @@ impl Serialize for Storage {
         match self {
             Self::S3(c) => TaggedStorage::S3(c.clone()).serialize(s),
             Self::HuggingFace(c) => TaggedStorage::Huggingface(c.clone()).serialize(s),
+            Self::Rclone(c) => TaggedStorage::Rclone(c.clone()).serialize(s),
         }
     }
 }
@@ -116,6 +152,7 @@ impl Storage {
         match self {
             Self::S3(c) => c.validate(),
             Self::HuggingFace(c) => c.validate(),
+            Self::Rclone(c) => c.validate(),
         }
     }
 
@@ -123,6 +160,7 @@ impl Storage {
         match self {
             Self::S3(c) => &c.prefix,
             Self::HuggingFace(c) => &c.prefix,
+            Self::Rclone(c) => &c.prefix,
         }
     }
 
@@ -132,10 +170,11 @@ impl Storage {
     }
 
     /// How downloads are authorised: vended credentials, or none.
-    pub fn credential_mode(&self) -> CredentialMode {
+    pub fn credential_mode(&self) -> AccessMode {
         match self {
-            Self::S3(c) => c.credentials,
-            Self::HuggingFace(_) => CredentialMode::Anonymous,
+            Self::S3(c) => c.credentials.into(),
+            Self::HuggingFace(_) => AccessMode::Anonymous,
+            Self::Rclone(_) => AccessMode::Rclone,
         }
     }
 
@@ -144,6 +183,7 @@ impl Storage {
         match self {
             Self::S3(c) => format!("bucket {}", c.bucket),
             Self::HuggingFace(c) => format!("Hugging Face {} {}", c.repo_type.as_str(), c.repo),
+            Self::Rclone(c) => c.describe(),
         }
     }
 }
@@ -203,6 +243,73 @@ impl HfStorage {
             return Err(format!("storage.revision {:?} is not a valid revision", self.revision));
         }
         validate_prefix(&self.prefix)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RcloneBackend {
+    /// Google Drive (rclone's `drive` backend).
+    Drive,
+}
+
+impl RcloneBackend {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Drive => "drive",
+        }
+    }
+}
+
+/// Packs on a Google Drive shared drive (or in a shared folder), read and written through
+/// rclone with each user's own Google account: whoever the drive is shared with may fetch
+/// them. Which drive and folder is fixed here, so every user's remote reads the same files
+/// whatever its own configuration says; the SHA-256 in the manifest pins the bytes.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RcloneStorage {
+    pub backend: RcloneBackend,
+    /// ID of the shared drive (the last part of its `drive.google.com/drive/folders/` URL).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_drive: Option<String>,
+    /// ID of a folder (in the shared drive, or a folder shared with the users).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_folder_id: Option<String>,
+    #[serde(default)]
+    pub prefix: String,
+}
+
+/// Google Drive file and drive IDs: URL-safe base64-ish, no separators.
+fn is_drive_id(id: &str) -> bool {
+    (10..=128).contains(&id.len()) && id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+}
+
+impl RcloneStorage {
+    fn validate(&self) -> std::result::Result<(), String> {
+        for (field, value) in [("team_drive", &self.team_drive), ("root_folder_id", &self.root_folder_id)] {
+            if let Some(id) = value {
+                if !is_drive_id(id) {
+                    return Err(format!("storage.{field} {id:?} is not a Google Drive ID"));
+                }
+            }
+        }
+        if self.team_drive.is_none() && self.root_folder_id.is_none() {
+            // Without either, every user's remote would start at their own "My Drive".
+            return Err(
+                "storage needs team_drive (a shared drive's ID) or root_folder_id (a shared folder's ID)".into()
+            );
+        }
+        validate_prefix(&self.prefix)
+    }
+
+    /// "Google Drive shared drive 0AB…" / "Google Drive folder 1a2…", for messages.
+    pub fn describe(&self) -> String {
+        match (&self.team_drive, &self.root_folder_id) {
+            (Some(d), Some(f)) => format!("Google Drive folder {f} in shared drive {d}"),
+            (Some(d), None) => format!("Google Drive shared drive {d}"),
+            (None, Some(f)) => format!("Google Drive folder {f}"),
+            (None, None) => "Google Drive".into(),
+        }
     }
 }
 
@@ -535,7 +642,7 @@ mod tests {
             (s.repo_type, s.revision.as_str(), s.endpoint.as_str()),
             (HfRepoType::Dataset, "main", "https://huggingface.co")
         );
-        assert_eq!(m.storage.credential_mode(), CredentialMode::Anonymous);
+        assert_eq!(m.storage.credential_mode(), AccessMode::Anonymous);
         assert_eq!(m.storage.describe(), "Hugging Face dataset AutowareFoundation/carla-packs");
 
         // The manifest survives a round trip (publish re-serialises it to validate a new entry).
@@ -555,6 +662,37 @@ mod tests {
             assert!(Manifest::parse(&bad, "t").is_err(), "{bad}");
         }
         assert!(Manifest::parse(&manifest("").replace("[storage]", "[storage]\ntype = \"s3\""), "t").is_ok());
+    }
+
+    #[test]
+    fn rclone_storage() {
+        let drive = |extra: &str| format!("schema = 1\n[storage]\ntype = \"rclone\"\nbackend = \"drive\"\n{extra}");
+        let shared = drive("team_drive = \"0ABcdEfGhIjKlUk9PVA\"\nprefix = \"packs/\"\n");
+        let m = Manifest::parse(&format!("{shared}{}", pack("1.0.0", "r")), "t").unwrap();
+        let Storage::Rclone(s) = &m.storage else { panic!("{:?}", m.storage) };
+        assert_eq!(
+            (s.backend, s.team_drive.as_deref(), s.root_folder_id.as_deref()),
+            (RcloneBackend::Drive, Some("0ABcdEfGhIjKlUk9PVA"), None)
+        );
+        assert_eq!(m.storage.credential_mode(), AccessMode::Rclone);
+        assert_eq!(m.storage.describe(), "Google Drive shared drive 0ABcdEfGhIjKlUk9PVA");
+        assert_eq!(m.storage.object_key("a.tar.gz"), "packs/a.tar.gz");
+        let again = Manifest::parse(&toml::to_string(&m).unwrap(), "t").unwrap();
+        assert!(matches!(again.storage, Storage::Rclone(_)));
+        assert!(Manifest::parse(&drive("root_folder_id = \"1a2b3c4d5e6f7g8h9i0j\"\n"), "t").is_ok());
+
+        for bad in [
+            drive(""), // neither a shared drive nor a folder: each user's own My Drive
+            drive("team_drive = \"0AB,root_folder_id=x\"\n"), // no smuggled rclone options
+            drive("team_drive = \"0AB'cd:efghij\"\n"),
+            drive("root_folder_id = \"short\"\n"),
+            drive("team_drive = \"0ABcdEfGhIjKlUk9PVA\"\nprefix = \"../\"\n"),
+            drive("team_drive = \"0ABcdEfGhIjKlUk9PVA\"\nbucket = \"x\"\n"),
+            drive("team_drive = \"0ABcdEfGhIjKlUk9PVA\"\n").replace("\"drive\"", "\"onedrive\""),
+            manifest("").replace("github-release", "rclone"),
+        ] {
+            assert!(Manifest::parse(&bad, "t").is_err(), "{bad}");
+        }
     }
 
     #[test]

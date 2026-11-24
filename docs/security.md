@@ -7,6 +7,8 @@
 | GitHub repository permissions | "Can read the pack repository = may fetch" is the definition. The manifest and key can only be read with this permission |
 | People with write access to the pack repository | They can change the manifest (where to fetch from, with which SHA-256) and the key workflow. Limit repository Write permission to pack publishers |
 | Permissions of the storage key | The temporary key is `object-read-only` (R2) / `s3:GetObject` by a session policy (AWS), both limited to the prefix |
+| Google Drive sharing (`type = "rclone"`) | Who the shared drive is shared with may fetch its packs, with their own Google account. The private pack repository decides who sees the list; the drive decides who gets the bytes. Both must allow it |
+| rclone | It runs with the user's Google credentials; install it from rclone.org or a trusted package manager |
 
 The client verifies the manifest's SHA-256 and size, and the hashes of every file in the pack's own `carla-pack.json`, before installing.
 Even if a file in storage is replaced, nothing is installed unless it matches the manifest.
@@ -26,6 +28,9 @@ Even if a file in storage is replaced, nothing is installed unless it matches th
 | Expired key | A key with less than 2 minutes left is not used, and the error names the cause (the workflow has stopped) | `expired_or_missing_credentials_are_reported` |
 | Endpoint substitution (SSRF-like redirection) | `endpoint` must be an https origin (http only for localhost), with no path, query or user info. Keys must be normalized relative paths | tests in `src/manifest.rs` |
 | Public packs on Hugging Face | Anonymous fetch that sends no token at all (neither GitHub nor Hugging Face). Even if the repository's contents (`main`, etc.) are rewritten, nothing is installed unless it matches the manifest's SHA-256. As a public repository, anything placed there is assumed fetchable by anyone | `public_packs_come_from_hugging_face_without_any_token` |
+| Packs on Google Drive read by the wrong drive | The drive and folder come from the manifest and are set on every rclone call (both, empty when absent), so a user's remote configured for another drive or folder cannot redirect the read. IDs are checked to be plain Drive IDs and the remote name a plain rclone name, so neither can smuggle rclone options | `pins_the_drive_and_folder_on_every_call`, `rclone_storage` |
+| A file on Google Drive replaced | The downloaded bytes are checked against the manifest's SHA-256 and size like any storage's; on publish, rclone compares the uploaded file's hash with the tarball's | `access_problems_have_their_own_codes` |
+| Google credentials leaking | carla-pack never reads them: rclone holds them in its own config (`rclone config file`); carla-pack passes only the remote's name. A token pasted with `drive login --token-stdin` is handed to `rclone config create` as an argument (visible to the same machine's process list for that moment) | — |
 | Local credentials | The saved token is in `config.json` (600). The storage key is kept only in memory and never appears in logs or errors (hidden even in `Debug`) | tests in `src/sigv4.rs` |
 
 ## Revocation and propagation delay
@@ -37,6 +42,16 @@ Even if a file in storage is replaced, nothing is installed unless it matches th
     Set the new parent token's access key ID in `R2_PARENT_ACCESS_KEY_ID` and run the workflow manually.
   - AWS: "Revoke active sessions" on the IAM role invalidates sessions issued before that point.
 - The lifetime can be shortened with the workflow's `TTL_SECONDS` / `role-duration-seconds` (shorten the cron interval as well).
+
+## Google Drive storage
+
+- **Revocation is immediate**: remove the user from the shared drive (or its group) and rclone's next request is refused.
+  No key was handed out, so there is nothing that stays valid until it expires.
+- **The read scope covers the whole Drive.** `carla-pack drive login` asks for `drive.readonly`, which can read every file the
+  user can read, not only the packs. The token stays in the user's rclone config (a long-lived refresh token, like `gh`'s);
+  protect it like their other credentials. A service account for CI should be a member of the pack drive only.
+- **Audit logs are better than for S3**: the Workspace's Drive audit log records each download with the user's account.
+- Google does not publish Drive's download limits; heavy parallel downloads of the same file can be refused for a while (`storage_error`).
 
 ## Residual risks and known limitations
 

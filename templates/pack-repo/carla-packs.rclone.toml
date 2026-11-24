@@ -1,0 +1,19 @@
+# carla-pack manifest for packs stored on a Google Drive shared drive, read through rclone.
+# Copy to the root of a pack repository as carla-packs.toml.
+#
+# Who may download the packs is decided by the shared drive's sharing (e.g. a Google
+# group as Viewer); keep the pack repository on GitHub private as well, so the list of
+# packs is only visible to the same people. No credential workflow is needed: every user
+# reads the drive with their own Google account (`carla-pack drive login`).
+schema = 1
+
+[storage]
+type = "rclone"
+backend = "drive"                     # Google Drive (the only rclone backend for now)
+team_drive = "0ABcdEfGhIjKlUk9PVA"     # the shared drive's ID (from its drive.google.com URL)
+# root_folder_id = "1a2b3c..."        # optional: a folder in it, or a folder shared with the users
+prefix = "packs/"
+
+# Publish a pack (uploads with rclone, then adds its entry here):
+#   carla-pack drive login --write      # a remote with write access (or a service account, see the docs)
+#   carla-pack publish <Pack>.tar.gz

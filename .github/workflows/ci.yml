@@ -20,6 +20,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - name: Install rclone (tests/rclone.rs runs it against a local folder)
+        env:
+          RCLONE_VERSION: v1.71.2
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/rclone.zip" \
+            "https://github.com/rclone/rclone/releases/download/${RCLONE_VERSION}/rclone-${RCLONE_VERSION}-linux-amd64.zip"
+          unzip -q -j "$RUNNER_TEMP/rclone.zip" '*/rclone' -d "$RUNNER_TEMP/bin"
+          echo "CARLA_PACK_TEST_RCLONE=$RUNNER_TEMP/bin/rclone" >> "$GITHUB_ENV"
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --features python -- -D warnings
       - run: cargo test

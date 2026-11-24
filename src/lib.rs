@@ -1,5 +1,6 @@
 //! Core of `carla-pack`: CARLA content packs shared through GitHub and S3-compatible storage
-//! (or, for public packs, the Hugging Face Hub).
+//! (or, for public packs, the Hugging Face Hub; inside a Google Workspace, a Google Drive
+//! shared drive read through rclone).
 //!
 //! There is no server. A pack repository on GitHub holds `carla-packs.toml` (where the
 //! packs are stored, and the SHA-256 of each) and, as a release asset, read-only storage
@@ -16,6 +17,7 @@ pub mod github;
 pub mod hf;
 pub mod manifest;
 pub mod pack;
+pub mod rclone;
 pub mod s3;
 pub mod sigv4;
 pub mod store;

@@ -14,6 +14,9 @@ carla-pack ──(1) GitHub API: read carla-packs.toml ────────�
   Who receives the packs is decided directly by Read permission on that repository (users / teams / organizations).
 - **Files are downloaded directly from S3-compatible storage** (Cloudflare R2, AWS S3, MinIO, SeaweedFS, etc.).
   Packs that anyone may have can also live in a **public Hugging Face Hub repository** (no key, anonymous download).
+- Inside a Google Workspace, packs can also live on a **Google Drive shared drive**, read through [rclone](https://rclone.org/)
+  with each user's own Google account: the drive's sharing decides who may download them, on top of the (private) pack repository
+  ([docs/pack-repository.md](docs/pack-repository.md#google-drive-shared-drive-read-through-rclone)).
 - The key is a **temporary key valid for 12 hours, recreated every 6 hours** by the pack repository's GitHub Actions. It can only read the pack prefix of the bucket.
   R2 issues it through its temporary credentials API and AWS through GitHub OIDC, so no long-lived key is stored anywhere.
 - Downloaded files are verified against the manifest's **SHA-256 and size**, and then against the hashes of every file in the pack's own `carla-pack.json`, before they are installed.
@@ -113,6 +116,7 @@ map_data("/opt/carla/CarlaUnreal/Packs/RoadgenHighwayPack", "RoadgenHighway", "o
 | Repositories to search | `--repo` (repeatable), `CARLA_PACK_REPOS` (comma-separated), `carla-pack repo add` |
 | Where settings are saved | `CARLA_PACK_CONFIG_DIR` (default `~/.config/carla-pack/config.json`, permissions 600) |
 | GitHub Enterprise Server | `CARLA_PACK_GITHUB_API` (e.g. `https://ghe.example.com/api/v3`) |
+| Google Drive storage (rclone) | `carla-pack drive login` creates the rclone remote `carla-pack-gdrive`; `CARLA_PACK_RCLONE` (the rclone executable), `CARLA_PACK_RCLONE_REMOTE` (another remote), `CARLA_PACK_RCLONE_SERVICE_ACCOUNT_FILE` (a service account key, for CI), `CARLA_PACK_DRIVE_CLIENT_ID` / `CARLA_PACK_DRIVE_CLIENT_SECRET` (your Workspace's OAuth client, for `drive login`) |
 
 `carla-pack login` is a device flow with the client ID of a GitHub App (recommended: Contents read-only, installed on the pack repositories)
 (`--client-id` / `CARLA_PACK_GITHUB_CLIENT_ID`; for an OAuth App, `--scope repo`). Not needed if you have run `gh auth login`.
@@ -149,7 +153,7 @@ PyPI releases are driven by PR labels. Merge a PR with exactly one `release:majo
 | --- | --- |
 | [docs/architecture.md](docs/architecture.md) | How it works, the manifest and key file formats, differences from the old Registry server |
 | [docs/security.md](docs/security.md) | Trust boundaries, revocation, residual risks |
-| [docs/pack-repository.md](docs/pack-repository.md) | How to create a pack repository (R2 / AWS / other S3-compatible storage) |
+| [docs/pack-repository.md](docs/pack-repository.md) | How to create a pack repository (R2 / AWS / other S3-compatible storage / Hugging Face / Google Drive) |
 | [docs/release.md](docs/release.md) | How `carla-pack-registry` is released to PyPI (label-driven, Trusted Publishing) |
 
 ## License

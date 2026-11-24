@@ -29,6 +29,18 @@ User's carla-pack / Python                    GitHub                          S3
 7. Install into <packs_dir>/<name> → (optional) carla.Client.mount_content_pack
 ```
 
+With Google Drive storage (`type = "rclone"`), steps 3 and 4 are replaced by rclone, run as a child process with the
+user's own Google credentials (their rclone remote, or a service account in CI); nothing is vended through GitHub:
+
+```
+3'. rclone cat [--offset N] -- '<remote>,team_drive=…,root_folder_id=…,shared_with_me=false:<prefix><key>'
+    ← tarball on stdout (saved while streaming SHA-256; a cut-off stream is resumed with --offset)
+    ✗ a refusal ends the download at once, classified from rclone's output: a missing file or a drive not shared
+      with the account → storage_no_access, no remote / a rejected token → storage_unauthenticated, quota → storage_error
+```
+
+The drive and folder are always set from the manifest (empty when absent), so a remote configured for another drive cannot redirect the read.
+
 The key issuer (the pack repository's GitHub Actions, every 6 hours):
 
 ```
@@ -55,6 +67,8 @@ credentials = "github-release"                           # github-release | anon
 credentials_tag = "carla-pack-credentials"               # optional
 # type = "s3" may be omitted (default). For public packs on Hugging Face:
 # type = "huggingface" / repo = "OWNER/NAME" / repo_type = "dataset" | "model" / revision = "main" / prefix
+# For a Google Drive shared drive read through rclone (each user's Google account):
+# type = "rclone" / backend = "drive" / team_drive = "<shared drive ID>" / root_folder_id = "<folder ID>" (optional) / prefix
 
 [[pack]]
 name = "NishishinjukuPack"            # CARLA pack name (letters, digits and _, starting with a letter)
@@ -132,6 +146,7 @@ A key with less than 2 minutes left is not used; the error says the key workflow
 | `src/manifest.rs` | Types and validation of `carla-packs.toml`, the reference `OWNER/REPO/PACK[@VER]`, release selection |
 | `src/sigv4.rs` | AWS Signature V4 (header signing, `UNSIGNED-PAYLOAD`). Verified with AWS's official test vectors |
 | `src/hf.rs` | Fetching from public Hugging Face repositories (anonymous `resolve` URLs, resumed with Range) |
+| `src/rclone.rs` | Google Drive through rclone: the pinned remote spec, `cat --offset` (streamed, resumed), `lsjson` (access check, existence before publishing), `copyto` (publish), rclone errors → codes |
 | `src/s3.rs` | GET (resumed with Range) / HEAD / PUT; multipart upload above 64 MiB (aborted on failure). Path / virtual-host addressing |
 | `src/client.rs` | `resolve` / `find_map` / `fetch` (cache and verification) / `install` / `unpack` / `formats` / `map_data` / `publish` |
 | `src/pack.rs` | Safe tarball extraction, checking every file against `carla-pack.json`, installation |
@@ -140,7 +155,7 @@ A key with less than 2 minutes left is not used; the error says the key workflow
 | `src/auth.rs` | GitHub device flow (client ID only, no client secret) |
 | `src/python.rs` | PyO3 bindings (`carla_pack_registry._core`) |
 | `python/carla_pack_registry/deploy.py` | `deploy_pack` / `ensure_map`: mount / unmount on the CARLA server |
-| `python/carla_pack_registry/publish.py` | `publish`: check (Rust `plan_publish`) → upload (S3 in Rust, Hugging Face via `huggingface_hub`) → append (`append_entry`) |
+| `python/carla_pack_registry/publish.py` | `publish`: check (Rust `plan_publish`) → upload (S3 and rclone in Rust, Hugging Face via `huggingface_hub`) → append (`append_entry`) |
 | `python/carla_pack_registry/cli.py` | The `carla-pack` command |
 | `templates/pack-repo/` | Manifest template and key rotation workflows for pack repositories |
 

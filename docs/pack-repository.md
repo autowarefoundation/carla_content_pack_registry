@@ -105,6 +105,69 @@ prefix = "packs/"
 
 This cannot be used for private packs (they are read anonymously). Put private packs on R2 / S3.
 
+### Google Drive (shared drive, read through rclone)
+
+For a Google Workspace: the packs sit on a **shared drive**, and **who may download them is the drive's sharing**
+(a Google group as Viewer, say). Each user reads it with their own Google account through [rclone](https://rclone.org/),
+so there is no storage key, no key workflow and nothing to rotate. Removing someone from the group stops their downloads at once.
+
+```
+carla-pack ──(1) GitHub API: carla-packs.toml (private repository) ──► GitHub
+           ──(2) rclone cat, as the user's Google account ──────────► Google Drive shared drive
+           ──(3) SHA-256 and carla-pack.json checked → install → mount
+```
+
+1. Create a **shared drive** (not a folder in someone's My Drive: its files would belong to that person, and a
+   service account cannot own files at all). Share it with the Google group of pack users as **Viewer**,
+   and with the publishers as **Content manager**.
+2. Create an **OAuth client** for your Workspace (Google Cloud console → APIs & Services, with the Google Drive API enabled):
+   an *Internal* consent screen (no Google review is needed for an internal app, even with Drive scopes),
+   and a client of type *Desktop app*. Hand its client ID and secret to your users (for an internal desktop
+   client the secret is not confidential), e.g. as `CARLA_PACK_DRIVE_CLIENT_ID` / `CARLA_PACK_DRIVE_CLIENT_SECRET`.
+   rclone's built-in client works too, but it is shared by every rclone user in the world and quickly rate-limited.
+3. Copy [templates/pack-repo/carla-packs.rclone.toml](../templates/pack-repo/carla-packs.rclone.toml) as `carla-packs.toml`
+   and set `team_drive` to the shared drive's ID (the last part of its `drive.google.com/drive/folders/...` URL).
+   Keep the pack repository **private** and give Read to the same people, so that only they see the list of packs.
+
+`carla-packs.toml`:
+
+```toml
+[storage]
+type = "rclone"
+backend = "drive"
+team_drive = "<shared drive ID>"
+# root_folder_id = "<folder ID>"   # optional: a folder in the shared drive (or a folder shared with the users)
+prefix = "packs/"
+```
+
+Each user, once (a current rclone on PATH, or in `CARLA_PACK_RCLONE`):
+
+```bash
+carla-pack drive login            # creates the rclone remote carla-pack-gdrive (read-only scope), in the browser
+carla-pack credentials tier4/carla-packs   # checks that the drive can be read
+```
+
+- Without a browser (a server): run `rclone authorize drive <client_id> <client_secret>` on a machine with one,
+  and pass what it prints to `carla-pack drive login --token-stdin` (or use `--headless` and paste it when rclone asks).
+- An existing Google Drive remote can be used instead: `CARLA_PACK_RCLONE_REMOTE=<name>`. carla-pack sets the drive and
+  folder on every call (rclone's `remote,team_drive=...,root_folder_id=...:path`), so the remote's own settings do not matter.
+- **CI / unattended runs**: create a service account, add it to the shared drive as Viewer, and set
+  `CARLA_PACK_RCLONE_SERVICE_ACCOUNT_FILE` to its JSON key (no rclone remote is needed then). Keep the key in the CI's secrets.
+
+Publishing uploads with rclone (`copyto`, which compares the uploaded file's hash with the tarball's) before the entry
+is appended; an existing file is not replaced without `--overwrite`. It needs write access: a remote of its own, or a service account that is a Content manager
+of the drive (`CARLA_PACK_RCLONE_SERVICE_ACCOUNT_FILE`):
+
+```bash
+carla-pack drive login --write --remote carla-pack-gdrive-rw
+CARLA_PACK_RCLONE_REMOTE=carla-pack-gdrive-rw carla-pack publish NishishinjukuPack-1.2.0-carla-0.10.0-Linux.tar.gz
+git commit -am "NishishinjukuPack 1.2.0" && git push
+```
+
+Limits: Google Drive is not a CDN. Google does not publish its download limits, and many machines fetching the same
+multi-GB file at once may get `downloadQuotaExceeded` (reported as `storage_error`; retry later). carla-pack fetches
+each release once into its cache, so share the cache (`CARLA_PACK_CACHE_DIR`) between jobs on the same machine.
+
 ### Public bucket
 
 Packs that anyone may fetch can be placed in a publicly readable bucket with `credentials = "anonymous"` (no key needed; the repository can be public as well).
@@ -125,12 +188,13 @@ git commit -am "NishishinjukuPack 1.2.0" && git push            # (a PR if the b
 - If the same `(name, version, base_release, platform)` already exists, it is refused. **Do not change a published release** (to change its contents, bump the version).
 - Files over 64 MiB are sent as a multipart upload (64 MiB parts by default, changed with `--part-size-mib`). Packs of several GB to hundreds of GB can be published as is (the limit is S3 / R2's 10,000 parts, and the part size is raised automatically). Each part is retried on failure; if it still fails, the upload is aborted and nothing is appended to the manifest.
 - If the file was already uploaded with another tool (`aws s3 cp` / `rclone`, etc.), `--no-upload` only appends.
+- On Google Drive storage the upload goes through rclone with the remote of `carla-pack drive login --write` (or a service account); see above.
 - To withdraw a release, add `yanked = true` to its entry (it can still be fetched from a lock pinned by SHA-256).
 
 ## 4. Checking
 
 ```bash
-carla-pack credentials tier4/carla-packs     # key ID and expiry (the secret is not shown)
+carla-pack credentials tier4/carla-packs     # key ID and expiry (the secret is not shown); for Google Drive, that the drive can be read
 carla-pack ls tier4/carla-packs
 carla-pack pull tier4/carla-packs/NishishinjukuPack -o /tmp/check
 ```
