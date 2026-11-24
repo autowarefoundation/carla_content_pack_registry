@@ -262,7 +262,7 @@ fn publish<'py>(
     description: Option<String>,
     part_size: Option<u64>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let opts = PublishOptions { key, upload, overwrite, description, part_size };
+    let opts = PublishOptions { key, upload, overwrite, description, part_size, rclone: None };
     let creds = Credentials::upload_from_env();
     call(py, || core_publish(&manifest, &tarball, &opts, creds.as_ref()))
 }
@@ -349,6 +349,18 @@ fn remove_repo(repo: &str) -> PyResult<bool> {
     Ok(removed)
 }
 
+/// How carla-pack runs rclone, from the environment: (binary, remote,
+/// service_account_file); `carla-pack drive login` configures that remote.
+#[pyfunction]
+fn rclone_settings() -> (String, String, Option<String>) {
+    let r = crate::rclone::Rclone::from_env();
+    (
+        r.binary.to_string_lossy().into_owned(),
+        r.remote,
+        r.service_account_file.map(|f| f.to_string_lossy().into_owned()),
+    )
+}
+
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("CarlaPackError", m.py().get_type::<CarlaPackError>())?;
@@ -365,5 +377,6 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(remove_repo, m)?)?;
     m.add_function(wrap_pyfunction!(map_formats, m)?)?;
     m.add_function(wrap_pyfunction!(map_data, m)?)?;
+    m.add_function(wrap_pyfunction!(rclone_settings, m)?)?;
     Ok(())
 }

@@ -1,5 +1,6 @@
 //! The client: find a pack in a GitHub repository the user can read, download it from the
-//! repository's S3-compatible bucket, verify it and install it.
+//! repository's storage (an S3-compatible bucket, a public Hugging Face repository, or a
+//! Google Drive read through rclone), verify it and install it.
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, BufWriter, Read, Write};
@@ -14,10 +15,11 @@ use sha2::{Digest, Sha256};
 use crate::error::{Error, Result};
 use crate::github::{GitHub, Vended};
 use crate::manifest::{
-    CredentialMode, Filter, HfStorage, Manifest, PackEntry, PackRef, Storage, StorageConfig, is_sha256, select,
-    validate_repo,
+    CredentialMode, Filter, HfStorage, Manifest, PackEntry, PackRef, RcloneStorage, Storage, StorageConfig, is_sha256,
+    select, validate_repo,
 };
 use crate::pack::{self, Expected, InstallOptions, InstalledPack};
+use crate::rclone::Rclone;
 use crate::s3::Bucket;
 use crate::sigv4::{Credentials, hex};
 use crate::store::{self, Store, Token};
@@ -67,6 +69,9 @@ pub struct CredentialStatus {
     pub mode: CredentialMode,
     pub access_key_id: Option<String>,
     pub expires_at: Option<String>,
+    /// For rclone storage: what reads it (the rclone remote, or a service account),
+    /// checked to be able to read it.
+    pub rclone: Option<String>,
 }
 
 pub struct Client {
@@ -77,6 +82,7 @@ pub struct Client {
     repos: Vec<String>,
     manifests: Mutex<HashMap<String, Manifest>>,
     credentials: Mutex<HashMap<String, Vended>>,
+    rclone: Rclone,
 }
 
 /// Everything a [`Client`] reads from the environment, for embedding and tests.
@@ -86,6 +92,8 @@ pub struct ClientOptions {
     pub repos: Vec<String>,
     pub github_api: String,
     pub cache_dir: PathBuf,
+    /// How rclone storage is read ([`Rclone::from_env`] by default).
+    pub rclone: Rclone,
 }
 
 impl Client {
@@ -102,6 +110,7 @@ impl Client {
             repos: repos.unwrap_or_else(|| saved.search_repos()),
             github_api: GitHub::default_api(),
             cache_dir: store::cache_dir()?,
+            rclone: Rclone::from_env(),
         })
     }
 
@@ -118,6 +127,7 @@ impl Client {
             repos: opts.repos,
             manifests: Mutex::default(),
             credentials: Mutex::default(),
+            rclone: opts.rclone,
         })
     }
 
@@ -248,7 +258,12 @@ impl Client {
             mode,
             access_key_id: None,
             expires_at: None,
+            rclone: None,
         };
+        if let Storage::Rclone(storage) = &m.storage {
+            self.rclone.check_access(storage)?;
+            status.rclone = Some(self.rclone.identity());
+        }
         if let Storage::S3(StorageConfig { credentials: CredentialMode::GithubRelease, credentials_tag, .. }) =
             &m.storage
         {
@@ -273,8 +288,9 @@ impl Client {
         }
         let manifest = self.manifest(&release.repo)?;
         let creds = self.storage_credentials(&release.repo, &manifest)?;
-        let source = Source::new(&manifest.storage, creds.as_ref());
+        let source = Source::new(&manifest.storage, creds.as_ref(), &self.rclone);
         let object_key = manifest.storage.object_key(&release.pack.key);
+        source.preflight(&object_key, release)?;
         let mut res = source.get(&self.http, &object_key)?;
 
         let dir = dest.parent().expect("blob path has a parent");
@@ -376,32 +392,66 @@ impl Client {
     }
 }
 
-/// Where a download comes from: a (signed) S3 bucket or a public Hugging Face repository.
+/// Where a download comes from: a (signed) S3 bucket, a public Hugging Face repository,
+/// or a Google Drive read through rclone.
 enum Source<'a> {
     S3(Bucket<'a>),
     HuggingFace(&'a HfStorage),
+    Rclone(&'a RcloneStorage, &'a Rclone),
 }
 
+type Body = Box<dyn Read + Send>;
+
 impl<'a> Source<'a> {
-    fn new(storage: &'a Storage, credentials: Option<&'a Credentials>) -> Self {
+    fn new(storage: &'a Storage, credentials: Option<&'a Credentials>, rclone: &'a Rclone) -> Self {
         match storage {
             Storage::S3(config) => Self::S3(Bucket { config, credentials }),
             Storage::HuggingFace(hf) => Self::HuggingFace(hf),
+            Storage::Rclone(config) => Self::Rclone(config, rclone),
         }
     }
 
-    fn get(&self, http: &Http, path: &str) -> Result<reqwest::blocking::Response> {
-        match self {
-            Self::S3(b) => b.get(http, path),
-            Self::HuggingFace(hf) => crate::hf::get(http, hf, path),
+    /// Checks before downloading what can be checked without the bytes. rclone: that the
+    /// file is readable (a typed access error rather than a broken stream), and that the
+    /// size and SHA-256 Google Drive reports match the manifest.
+    fn preflight(&self, path: &str, release: &Release) -> Result<()> {
+        let Self::Rclone(storage, rclone) = self else { return Ok(()) };
+        let Some(found) = rclone.stat(storage, path)? else {
+            return Err(Error::StorageNoAccess(format!(
+                "{path} is not in {} as {} (the file is missing, or not shared with that account)",
+                storage.describe(),
+                rclone.identity()
+            )));
+        };
+        if found.size != release.pack.size || found.sha256.as_deref().is_some_and(|h| h != release.pack.sha256) {
+            return Err(Error::Integrity(format!(
+                "{path} in {} does not match its manifest entry in {} (expected {} bytes, sha256 {}; the storage \
+                 reports {} bytes, sha256 {}); nothing was downloaded",
+                storage.describe(),
+                release.repo,
+                release.pack.size,
+                release.pack.sha256,
+                found.size,
+                found.sha256.as_deref().unwrap_or("unknown")
+            )));
         }
+        Ok(())
     }
 
-    fn get_from(&self, http: &Http, path: &str, offset: u64) -> Result<Option<reqwest::blocking::Response>> {
-        match self {
-            Self::S3(b) => b.get_from(http, path, offset),
-            Self::HuggingFace(hf) => crate::hf::get_from(http, hf, path, offset),
-        }
+    fn get(&self, http: &Http, path: &str) -> Result<Body> {
+        Ok(match self {
+            Self::S3(b) => Box::new(b.get(http, path)?),
+            Self::HuggingFace(hf) => Box::new(crate::hf::get(http, hf, path)?),
+            Self::Rclone(storage, rclone) => Box::new(rclone.open(storage, path, 0)?),
+        })
+    }
+
+    fn get_from(&self, http: &Http, path: &str, offset: u64) -> Result<Option<Body>> {
+        Ok(match self {
+            Self::S3(b) => b.get_from(http, path, offset)?.map(|r| Box::new(r) as Body),
+            Self::HuggingFace(hf) => crate::hf::get_from(http, hf, path, offset)?.map(|r| Box::new(r) as Body),
+            Self::Rclone(storage, rclone) => Some(Box::new(rclone.open(storage, path, offset)?)),
+        })
     }
 }
 
@@ -417,6 +467,8 @@ pub struct PublishOptions {
     pub description: Option<String>,
     /// Multipart part size in bytes (default 64 MiB); files up to one part go up in one PUT.
     pub part_size: Option<u64>,
+    /// How rclone storage is written ([`Rclone::from_env`] by default).
+    pub rclone: Option<Rclone>,
 }
 
 /// A checked publication: the manifest entry for a tarball, and where it goes.
@@ -522,6 +574,12 @@ pub fn publish(
     if opts.upload {
         let storage = match &plan.storage {
             Storage::S3(s) => s,
+            Storage::Rclone(r) => {
+                let rclone = opts.rclone.clone().unwrap_or_else(Rclone::from_env);
+                rclone.upload(r, tarball, &plan.object_key, opts.overwrite, plan.entry.size, &plan.entry.sha256)?;
+                append_entry(manifest_path, &plan.entry)?;
+                return Ok(plan.entry);
+            }
             Storage::HuggingFace(hf) => {
                 return Err(Error::Usage(format!(
                     "uploading to Hugging Face goes through the Python package (`carla-pack publish`, or \

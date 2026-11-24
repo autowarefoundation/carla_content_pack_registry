@@ -44,6 +44,7 @@ impl World {
             repos: repos.iter().map(|r| r.to_string()).collect(),
             github_api: self.github.base_url(),
             cache_dir: self.dir.path().join("cache"),
+            rclone: Default::default(),
         })
         .unwrap()
     }

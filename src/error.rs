@@ -18,6 +18,16 @@ pub enum Error {
     Credentials(String),
     #[error("storage error {status}: {message}")]
     Storage { status: u16, message: String },
+    /// rclone (the client of `type = "rclone"` storage) is not installed or cannot run.
+    #[error("{0}")]
+    RcloneUnavailable(String),
+    /// The storage has no credentials for the user: no rclone remote, or Google rejected its token.
+    #[error("{0}")]
+    StorageUnauthenticated(String),
+    /// The storage refused the user, or does not have the file: on Google Drive, a drive or
+    /// folder that is not shared with the user's Google account looks the same as a missing one.
+    #[error("{0}")]
+    StorageNoAccess(String),
     /// Downloaded bytes do not match the SHA-256 or size in the manifest.
     #[error("{0}")]
     Integrity(String),
@@ -56,6 +66,9 @@ impl Error {
             Self::GitHub { .. } => "github_error",
             Self::Credentials(_) => "credentials_unavailable",
             Self::Storage { .. } => "storage_error",
+            Self::RcloneUnavailable(_) => "rclone_unavailable",
+            Self::StorageUnauthenticated(_) => "storage_unauthenticated",
+            Self::StorageNoAccess(_) => "storage_no_access",
             Self::Integrity(_) => "checksum_mismatch",
             Self::Manifest(_) => "invalid_manifest",
             Self::NotFound(_) => "not_found",
