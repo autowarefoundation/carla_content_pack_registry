@@ -83,6 +83,7 @@ pub struct Client {
     manifests: Mutex<HashMap<String, Manifest>>,
     credentials: Mutex<HashMap<String, Vended>>,
     rclone: Rclone,
+    offline: bool,
 }
 
 /// Everything a [`Client`] reads from the environment, for embedding and tests.
@@ -94,12 +95,15 @@ pub struct ClientOptions {
     pub cache_dir: PathBuf,
     /// How rclone storage is read ([`Rclone::from_env`] by default).
     pub rclone: Rclone,
+    /// Use only the cache: never contact GitHub or the storage (`CARLA_PACK_OFFLINE`).
+    pub offline: bool,
 }
 
 impl Client {
     /// `token`: explicit GitHub token, else the lookup in [`store::find_token`].
     /// `repos`: repositories searched by map name, else `CARLA_PACK_REPOS` / the saved list.
-    pub fn new(token: Option<String>, repos: Option<Vec<String>>) -> Result<Self> {
+    /// `offline`: use only the cache, else `CARLA_PACK_OFFLINE`.
+    pub fn new(token: Option<String>, repos: Option<Vec<String>>, offline: Option<bool>) -> Result<Self> {
         let saved = Store::load()?;
         let token = match token {
             Some(value) => Some(Token { value, source: "argument" }),
@@ -111,6 +115,7 @@ impl Client {
             github_api: GitHub::default_api(),
             cache_dir: store::cache_dir()?,
             rclone: Rclone::from_env(),
+            offline: offline.unwrap_or_else(store::offline_from_env),
         })
     }
 
@@ -128,6 +133,7 @@ impl Client {
             manifests: Mutex::default(),
             credentials: Mutex::default(),
             rclone: opts.rclone,
+            offline: opts.offline,
         })
     }
 
@@ -144,8 +150,24 @@ impl Client {
         &self.cache_dir
     }
 
+    /// Whether the client uses only the cache.
+    pub fn offline(&self) -> bool {
+        self.offline
+    }
+
+    fn offline_error(&self, what: &str) -> Error {
+        Error::Offline(format!(
+            "{what}: carla-pack is offline (CARLA_PACK_OFFLINE), and only the packs already in its cache ({}) can be \
+             used; fetch it once online",
+            self.cache_dir.display()
+        ))
+    }
+
     /// The GitHub user of the token.
     pub fn whoami(&self) -> Result<serde_json::Value> {
+        if self.offline {
+            return Err(self.offline_error("asking GitHub who the token belongs to"));
+        }
         self.github.user()
     }
 
@@ -153,6 +175,9 @@ impl Client {
     /// token cannot read the repository: this is the access check.
     pub fn manifest(&self, repo: &str) -> Result<Manifest> {
         validate_repo(repo)?;
+        if self.offline {
+            return Err(self.offline_error(&format!("reading the pack list of {repo}")));
+        }
         let key = repo.to_ascii_lowercase();
         if let Some(m) = self.manifests.lock().unwrap().get(&key) {
             return Ok(m.clone());
@@ -169,9 +194,15 @@ impl Client {
     }
 
     /// Every release `repo` lists, newest first.
+    /// Offline, the releases of `repo` in the cache.
     pub fn list_packs(&self, repo: &str) -> Result<Vec<Release>> {
-        let m = self.manifest(repo)?;
-        let mut out: Vec<Release> = m.packs.into_iter().map(|pack| Release { repo: repo.to_string(), pack }).collect();
+        let mut out: Vec<Release> = if self.offline {
+            validate_repo(repo)?;
+            self.cached_releases().into_iter().filter(|r| r.repo.eq_ignore_ascii_case(repo)).collect()
+        } else {
+            let m = self.manifest(repo)?;
+            m.packs.into_iter().map(|pack| Release { repo: repo.to_string(), pack }).collect()
+        };
         out.sort_by(|a, b| {
             a.pack.name.cmp(&b.pack.name).then(crate::manifest::compare_versions(&b.pack.version, &a.pack.version))
         });
@@ -179,8 +210,23 @@ impl Client {
     }
 
     /// The release `reference` names, narrowed by `filter`: the newest version unless the
-    /// reference has one.
+    /// reference has one. A release pinned by SHA-256 that is in the cache is taken from it
+    /// without asking GitHub; offline, only cached releases are considered.
     pub fn resolve(&self, reference: &PackRef, filter: &Filter) -> Result<Release> {
+        let named = |r: &Release| {
+            r.repo.eq_ignore_ascii_case(&reference.repo)
+                && r.pack.name == reference.name
+                && reference.version.as_ref().is_none_or(|v| *v == r.pack.version)
+                && filter.matches(&r.pack)
+        };
+        if let Some(r) = self.cached_pinned(filter).filter(|r| named(r)) {
+            return Ok(r);
+        }
+        if self.offline {
+            let candidates = self.cached_releases().into_iter().filter(|r| named(r)).collect();
+            return select(candidates, |r| &r.pack, &reference.to_string())
+                .map_err(|_| self.offline_error(&format!("{reference} is not in the cache")));
+        }
         let m = self.manifest(&reference.repo)?;
         let candidates: Vec<&PackEntry> = m
             .packs
@@ -192,18 +238,78 @@ impl Client {
         Ok(Release { repo: reference.repo.clone(), pack })
     }
 
+    /// The cached release `filter.sha256` pins, if there is one.
+    fn cached_pinned(&self, filter: &Filter) -> Option<Release> {
+        let sha = filter.sha256.as_deref()?.to_ascii_lowercase();
+        is_sha256(&sha).then(|| self.cached_release(&sha)).flatten()
+    }
+
+    /// Where the manifest entry of a cached tarball is kept: `blobs/<sha256>.json`.
+    fn release_record(&self, sha256: &str) -> PathBuf {
+        self.cache_dir.join("blobs").join(format!("{sha256}.json"))
+    }
+
+    /// The release a cached (and complete) tarball was fetched as.
+    fn cached_release(&self, sha256: &str) -> Option<Release> {
+        let release: Release = serde_json::from_slice(&fs::read(self.release_record(sha256)).ok()?).ok()?;
+        let complete =
+            fs::metadata(self.cached_path(sha256)).is_ok_and(|m| m.is_file() && m.len() == release.pack.size);
+        (release.pack.sha256 == sha256 && complete).then_some(release)
+    }
+
+    /// Every release in the cache.
+    fn cached_releases(&self) -> Vec<Release> {
+        let Ok(dir) = fs::read_dir(self.cache_dir.join("blobs")) else { return Vec::new() };
+        dir.filter_map(|e| {
+            let name = e.ok()?.file_name().into_string().ok()?;
+            self.cached_release(name.strip_suffix(".json").filter(|s| is_sha256(s))?)
+        })
+        .collect()
+    }
+
+    /// Records `release` beside its cached tarball, for pinned and offline lookups. Best
+    /// effort: a cache that cannot be written to is still a cache.
+    fn remember(&self, release: &Release) {
+        let path = self.release_record(&release.pack.sha256);
+        if path.exists() {
+            return;
+        }
+        let Ok(json) = serde_json::to_vec_pretty(release) else { return };
+        let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+        if fs::write(&tmp, json).and_then(|()| fs::rename(&tmp, &path)).is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+    }
+
     /// The newest release providing the CARLA map `map` in `repos` (default: the client's
     /// search list). Repositories the token cannot read are skipped; if nothing is found,
     /// the error says which ones were.
     pub fn find_map(&self, map: &str, repos: Option<&[String]>, filter: &Filter) -> Result<Release> {
         let repos = repos.unwrap_or(&self.repos);
+        let short = |m: &str| m.rsplit('/').next().unwrap_or(m).to_string();
+        let wanted = short(map);
+        let provides = |p: &PackEntry| {
+            let named = p.maps.iter().any(|x| short(x) == wanted)
+                || (filter.assets && p.formats.keys().any(|x| short(x) == wanted));
+            named && filter.matches_map(p, &wanted)
+        };
+        // Offline with no repositories listed, any cached pack will do.
+        let searched = |r: &Release| {
+            (repos.is_empty() || repos.iter().any(|x| x.eq_ignore_ascii_case(&r.repo))) && provides(&r.pack)
+        };
+        if let Some(r) = self.cached_pinned(filter).filter(|r| searched(r)) {
+            return Ok(r);
+        }
+        if self.offline {
+            let candidates = self.cached_releases().into_iter().filter(|r| searched(r)).collect();
+            return select(candidates, |r| &r.pack, &format!("map {wanted}"))
+                .map_err(|_| self.offline_error(&format!("no cached pack provides map {wanted}")));
+        }
         if repos.is_empty() {
             return Err(Error::Usage(
                 "no pack repositories to search; run `carla-pack repo add OWNER/REPO` or set CARLA_PACK_REPOS".into(),
             ));
         }
-        let short = |m: &str| m.rsplit('/').next().unwrap_or(m).to_string();
-        let wanted = short(map);
         let mut candidates = Vec::new();
         let mut unreadable = Vec::new();
         for repo in repos {
@@ -215,13 +321,7 @@ impl Client {
                 }
                 Err(e) => return Err(e),
             };
-            for p in m.packs {
-                let named = p.maps.iter().any(|x| short(x) == wanted)
-                    || (filter.assets && p.formats.keys().any(|x| short(x) == wanted));
-                if named && filter.matches_map(&p, &wanted) {
-                    candidates.push(Release { repo: repo.clone(), pack: p });
-                }
-            }
+            candidates.extend(m.packs.into_iter().filter(&provides).map(|pack| Release { repo: repo.clone(), pack }));
         }
         select(candidates, |r| &r.pack, &format!("map {wanted}")).map_err(|e| match e {
             Error::NotFound(msg) if !unreadable.is_empty() => {
@@ -284,7 +384,11 @@ impl Client {
     pub fn fetch(&self, release: &Release) -> Result<PathBuf> {
         let dest = self.cached_path(&release.pack.sha256);
         if fs::metadata(&dest).is_ok_and(|m| m.is_file() && m.len() == release.pack.size) {
+            self.remember(release);
             return Ok(dest);
+        }
+        if self.offline {
+            return Err(self.offline_error(&format!("{} is not in the cache", release.reference())));
         }
         let manifest = self.manifest(&release.repo)?;
         let creds = self.storage_credentials(&release.repo, &manifest)?;
@@ -351,6 +455,7 @@ impl Client {
         match result {
             Ok(()) => {
                 fs::rename(&part, &dest)?;
+                self.remember(release);
                 Ok(dest)
             }
             Err(e) => {

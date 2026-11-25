@@ -35,6 +35,9 @@ Even if a file in storage is replaced, nothing is installed unless it matches th
 
 ## Revocation and propagation delay
 
+- **Cached packs stay usable.** A pack in someone's cache can be installed offline (or pinned by SHA-256) after their access
+  is removed, as any file they downloaded could; revoking access stops new downloads, not copies already made.
+
 - **Removing a person**: once removed from the pack repository (or team), they can no longer fetch the manifest or new keys.
   However, **a key already fetched stays valid until it expires (up to 12 hours)**. That is longer than the old version's signed URLs (5 minutes).
 - **Stopping access immediately**: disable the key source.

@@ -37,6 +37,12 @@ pub fn config_dir() -> Result<PathBuf> {
 }
 
 /// Where downloaded packs are kept, by SHA-256: `CARLA_PACK_CACHE_DIR`, else e.g. `~/.cache/carla-pack`.
+/// `CARLA_PACK_OFFLINE`: set (and not `0` / `false` / `no`) to use only the cache.
+pub fn offline_from_env() -> bool {
+    std::env::var("CARLA_PACK_OFFLINE")
+        .is_ok_and(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "" | "0" | "false" | "no"))
+}
+
 pub fn cache_dir() -> Result<PathBuf> {
     if let Some(d) = std::env::var_os("CARLA_PACK_CACHE_DIR").filter(|d| !d.is_empty()) {
         return Ok(PathBuf::from(d));

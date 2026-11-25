@@ -77,6 +77,7 @@ impl World {
             github_api: self.github.base_url(),
             cache_dir: self.dir.path().join("cache"),
             rclone,
+            offline: false,
         })
         .unwrap()
     }

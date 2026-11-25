@@ -45,6 +45,20 @@ impl World {
             github_api: self.github.base_url(),
             cache_dir: self.dir.path().join("cache"),
             rclone: Default::default(),
+            offline: false,
+        })
+        .unwrap()
+    }
+
+    /// A client that uses only the cache (`CARLA_PACK_OFFLINE`).
+    fn offline_client(&self, repos: &[&str]) -> Client {
+        Client::with_options(ClientOptions {
+            token: None,
+            repos: repos.iter().map(|r| r.to_string()).collect(),
+            github_api: self.github.base_url(),
+            cache_dir: self.dir.path().join("cache"),
+            rclone: Default::default(),
+            offline: true,
         })
         .unwrap()
     }
@@ -389,4 +403,59 @@ fn the_hugging_face_template_is_a_valid_manifest() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("templates/pack-repo/carla-packs.huggingface.toml");
     let m = carla_pack_registry::manifest::Manifest::parse(&fs::read_to_string(path).unwrap(), "template").unwrap();
     assert!(matches!(m.storage, carla_pack_registry::manifest::Storage::HuggingFace(_)));
+}
+
+#[test]
+fn cached_packs_are_used_without_the_network() {
+    let w = World::new();
+    let body = mini_pack(&[]);
+    let sha = hex_sha256(&body);
+    let manifest = w.github.mock(|when, then| {
+        when.method(GET).path(format!("/repos/{REPO}/contents/carla-packs.toml"));
+        then.status(200).body(w.manifest_text("anonymous", &[("1.0.0", &body)]));
+    });
+    let object = w.storage.mock(|when, then| {
+        when.method(GET).path(format!("/{BUCKET}/packs/{KEY}"));
+        then.status(200).body(body.clone());
+    });
+
+    // Offline before anything is cached: nothing to use, and no request is made.
+    let off = w.offline_client(&[REPO]);
+    let e = off.find_map("MiniTown", None, &Filter::default()).unwrap_err();
+    assert_eq!(e.code(), "offline", "{e}");
+    assert_eq!(off.whoami().unwrap_err().code(), "offline");
+    assert_eq!((manifest.calls(), object.calls()), (0, 0));
+
+    // Fetched once online ...
+    let first = w.client(Some(TOKEN), &[REPO]);
+    let release = first.find_map("MiniTown", None, &Filter::default()).unwrap();
+    first.fetch(&release).unwrap();
+    assert_eq!((manifest.calls(), object.calls()), (1, 1));
+
+    // ... a pinned release comes from the cache without asking GitHub, even online.
+    let pinned = Filter { sha256: Some(sha.to_uppercase()), ..Filter::default() };
+    let online = w.client(Some(TOKEN), &[REPO]);
+    assert_eq!(online.resolve(&reference("tier4/carla-packs/MiniPack"), &pinned).unwrap(), release);
+    assert_eq!(online.find_map("MiniTown", None, &pinned).unwrap(), release);
+    assert_eq!(manifest.calls(), 1);
+
+    // Offline, cached releases are found by reference or map, listed, and installed.
+    let off = w.offline_client(&[]);
+    assert_eq!(off.resolve(&reference("TIER4/carla-packs/MiniPack@1.0.0"), &Filter::default()).unwrap(), release);
+    assert_eq!(off.find_map("MiniTown", None, &Filter::default()).unwrap(), release);
+    assert_eq!(off.list_packs(REPO).unwrap(), std::slice::from_ref(&release));
+    let pack = off.install(&release, &w.packs(), &InstallOptions::default()).unwrap();
+    assert_eq!(pack.maps, ["MiniTown"]);
+    let e = off.resolve(&reference("tier4/carla-packs/MiniPack@2.0.0"), &Filter::default()).unwrap_err();
+    assert_eq!(e.code(), "offline", "{e}");
+    assert!(e.to_string().contains("not in the cache"), "{e}");
+    assert_eq!(
+        off.find_map("MiniTown", Some(&["other/repo".into()]), &Filter::default()).unwrap_err().code(),
+        "offline"
+    );
+    assert_eq!((manifest.calls(), object.calls()), (1, 1));
+
+    // A tarball that is gone (or cut short) is not offered.
+    fs::write(w.dir.path().join("cache/blobs").join(format!("{sha}.tar.gz")), b"x").unwrap();
+    assert_eq!(off.find_map("MiniTown", None, &Filter::default()).unwrap_err().code(), "offline");
 }

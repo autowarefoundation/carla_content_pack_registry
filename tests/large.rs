@@ -212,6 +212,7 @@ fn broken_downloads_resume_where_they_stopped() {
         github_api: github.base_url(),
         cache_dir: dir.path().join("cache"),
         rclone: Default::default(),
+        offline: false,
     })
     .unwrap();
     let release = client.resolve(&PackRef::parse("o/packs/MiniPack").unwrap(), &Filter::default()).unwrap();

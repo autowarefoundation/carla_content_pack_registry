@@ -77,6 +77,22 @@ c.install(release, packs_dir)                    # verify and install into <pack
   A multi-gigabyte pack uses **about twice its size** on disk: the cached tarball plus the extracted pack.
 - If the connection drops, the download resumes from the received offset with a Range request (up to 5 times). A resumed download is still verified against the whole file's SHA-256.
 
+### Offline (cached packs only)
+
+Each cached tarball is kept with its manifest entry (`blobs/<sha256>.json`), so a pack fetched once can be used without the network:
+
+- **Pinned by SHA-256** (`--sha256`, `sha256=`, a lock file): a cached release is used as it is, **without asking GitHub**, online or not.
+- **Offline** (`--offline`, `CARLA_PACK_OFFLINE=1`, or `Client(offline=True)`): GitHub and the storage are never contacted.
+  References and map names are resolved among the cached releases (the newest that matches; with no repositories listed,
+  any cached repository), and `ls` lists them. Anything not cached fails with the code `offline`.
+
+```bash
+carla-pack install NishishinjukuMap --map --packs-dir ./Packs          # online, once: fetched into the cache
+CARLA_PACK_OFFLINE=1 carla-pack install NishishinjukuMap --map --packs-dir ./Packs   # later, without the network
+```
+
+Share or mount the cache directory (`CARLA_PACK_CACHE_DIR`) to give machines without network access the packs fetched elsewhere.
+
 ### Getting map data by format
 
 A pack's map data can be retrieved as local paths by map name and format name. No CARLA server is needed (the pack is fetched, verified and extracted into the cache).
@@ -114,6 +130,7 @@ map_data("/opt/carla/CarlaUnreal/Packs/RoadgenHighwayPack", "RoadgenHighway", "o
 | --- | --- |
 | GitHub token | in order: `CARLA_PACK_TOKEN` → `GH_TOKEN` → `GITHUB_TOKEN` → the one saved by `carla-pack login` → `gh auth token` |
 | Repositories to search | `--repo` (repeatable), `CARLA_PACK_REPOS` (comma-separated), `carla-pack repo add` |
+| Offline (cache only) | `--offline`, `CARLA_PACK_OFFLINE=1` |
 | Where settings are saved | `CARLA_PACK_CONFIG_DIR` (default `~/.config/carla-pack/config.json`, permissions 600) |
 | GitHub Enterprise Server | `CARLA_PACK_GITHUB_API` (e.g. `https://ghe.example.com/api/v3`) |
 | Google Drive storage (rclone) | `carla-pack drive login` creates the rclone remote `carla-pack-gdrive`; `CARLA_PACK_RCLONE` (the rclone executable), `CARLA_PACK_RCLONE_REMOTE` (another remote), `CARLA_PACK_RCLONE_SERVICE_ACCOUNT_FILE` (a service account key, for CI), `CARLA_PACK_DRIVE_CLIENT_ID` / `CARLA_PACK_DRIVE_CLIENT_SECRET` (your Workspace's OAuth client, for `drive login`) |

@@ -78,11 +78,17 @@ impl Client {
 impl Client {
     /// `token`: a GitHub token; default CARLA_PACK_TOKEN / GH_TOKEN / GITHUB_TOKEN / the saved
     /// login / `gh auth token`. `repos`: repositories searched by map name; default
-    /// CARLA_PACK_REPOS / the saved list.
+    /// CARLA_PACK_REPOS / the saved list. `offline`: use only the cache (never contact
+    /// GitHub or the storage); default CARLA_PACK_OFFLINE.
     #[new]
-    #[pyo3(signature = (token=None, repos=None))]
-    fn new(token: Option<String>, repos: Option<Vec<String>>) -> PyResult<Self> {
-        Ok(Self { inner: CoreClient::new(token, repos).map_err(to_py)? })
+    #[pyo3(signature = (token=None, repos=None, offline=None))]
+    fn new(token: Option<String>, repos: Option<Vec<String>>, offline: Option<bool>) -> PyResult<Self> {
+        Ok(Self { inner: CoreClient::new(token, repos, offline).map_err(to_py)? })
+    }
+
+    #[getter]
+    fn offline(&self) -> bool {
+        self.inner.offline()
     }
 
     #[getter]

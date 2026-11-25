@@ -41,6 +41,9 @@ pub enum Error {
     Usage(String),
     #[error("interrupted")]
     Interrupted,
+    /// Offline (`CARLA_PACK_OFFLINE`): what was asked for needs the network, or is not cached.
+    #[error("{0}")]
+    Offline(String),
     /// The downloaded file is not a valid content pack (layout, manifest or checksums).
     #[error("{0}")]
     Pack(String),
@@ -73,6 +76,7 @@ impl Error {
             Self::Manifest(_) => "invalid_manifest",
             Self::NotFound(_) => "not_found",
             Self::Interrupted => "interrupted",
+            Self::Offline(_) => "offline",
             Self::Pack(_) => "invalid_pack",
             Self::Incompatible(_) => "incompatible_pack",
             Self::Usage(_) => "usage",

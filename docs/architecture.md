@@ -123,6 +123,17 @@ A pack's map data can be looked up by map name and format name. No CARLA server 
 - In a built pack, every file the asset file points to must be listed in `files` of `carla-pack.json` (confirming it is covered by the SHA-256 check at install). Otherwise the whole asset file is refused.
 - A `schema` other than 1 is an error.
 
+### The cache (`CARLA_PACK_CACHE_DIR`, default `~/.cache/carla-pack`)
+
+| Path | Contents |
+| --- | --- |
+| `blobs/<sha256>.tar.gz` | A verified tarball (written to a `.part` file, renamed once its size and SHA-256 match) |
+| `blobs/<sha256>.json` | The release it was fetched as (repository and manifest entry): what a pinned or offline lookup resolves against |
+| `packs/<sha256>/<name>` | The pack unpacked for its map data (`unpack`, `formats`, `map_data`) |
+
+A release pinned by SHA-256 whose tarball is cached is taken from `blobs/` without reading the manifest. Offline
+(`CARLA_PACK_OFFLINE`), every lookup is made among `blobs/*.json` and nothing is requested from GitHub or the storage.
+
 ### `credentials.json` (Release asset)
 
 ```json
