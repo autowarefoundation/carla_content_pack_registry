@@ -27,7 +27,7 @@ class CliError(Exception):
 
 
 def _client(args: argparse.Namespace) -> Client:
-    return Client(repos=args.repo_list or None)
+    return Client(repos=args.repo_list or None, offline=True if args.offline else None)
 
 
 def _out(args: argparse.Namespace, data: Any, human: Callable[[], None]) -> None:
@@ -381,6 +381,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--version", action="version", version=f"carla-pack {_core.__version__}")
     p.add_argument("--json", action="store_true", help="machine-readable output")
     p.add_argument(
+        "--offline", action="store_true",
+        help="use only the packs already in the cache; never contact GitHub or the storage (CARLA_PACK_OFFLINE)",
+    )
+    p.add_argument(
         "--repo",
         dest="repo_list",
         action="append",
@@ -390,6 +394,9 @@ def build_parser() -> argparse.ArgumentParser:
     # The same options after the subcommand; SUPPRESS keeps a value given before it.
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="machine-readable output")
+    common.add_argument(
+        "--offline", action="store_true", default=argparse.SUPPRESS, help="use only the packs already in the cache"
+    )
     common.add_argument(
         "--repo", dest="repo_list", action="append", metavar="OWNER/REPO", default=argparse.SUPPRESS,
         help="search this pack repository (repeatable)",

@@ -70,6 +70,16 @@ def test_publish_then_install_through_github_and_s3(world: dict[str, Any]) -> No
     code, out, err = w["run"]("credentials", REPO)
     assert code == 0 and "2099-01-01T00:00:00Z" in out and "secret" not in out.lower(), err
 
+    # Offline, with GitHub out of reach: the cached pack is still found, listed and installed.
+    w["monkeypatch"].setenv("CARLA_PACK_GITHUB_API", "http://127.0.0.1:9")
+    elsewhere = w["tmp"] / "PacksOffline"
+    code, out, err = w["run"]("--offline", "install", "MiniTown", "--map", "--packs-dir", str(elsewhere))
+    assert code == 0 and (elsewhere / "MiniPack" / "carla-pack.json").is_file(), err
+    code, out, err = w["run"]("ls", REPO, "--offline")
+    assert code == 0 and "tier4/carla-packs/MiniPack@1.0.0" in out, err
+    code, out, err = w["run"]("--offline", "install", f"{REPO}/MiniPack@9.9.9", "--packs-dir", str(elsewhere))
+    assert code == 1 and "offline" in err and "not in the cache" in err, err
+
 
 def test_without_repository_access_there_is_nothing_to_download(world: dict[str, Any]) -> None:
     w = world
